@@ -6,7 +6,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node src/server.js"
+    "dev": "node src/server.js",
+    "totp:secret": "node scripts/generate-totp-secret.js"
   },
   "engines": {
     "node": ">=18.17"

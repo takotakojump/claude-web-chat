@@ -3,6 +3,21 @@
     "host": "127.0.0.1",
     "port": 3652
   },
+  "auth": {
+    "enabled": false,
+    "password": "",
+    "passwordSha256": "",
+    "sessionHours": 12,
+    "maxAttemptsPerMinute": 12,
+    "cookieSecure": false,
+    "totp": {
+      "enabled": false,
+      "secret": "",
+      "period": 30,
+      "digits": 6,
+      "window": 1
+    }
+  },
   "claude": {
     "command": "",
     "cwd": "..",

@@ -8,6 +8,7 @@ const elements = {
   newChatButton: document.getElementById('newChatButton'),
   startButton: document.getElementById('startButton'),
   interruptButton: document.getElementById('interruptButton'),
+  logoutButton: document.getElementById('logoutButton'),
   statusDot: document.getElementById('statusDot'),
   statusText: document.getElementById('statusText'),
   mobileStatus: document.getElementById('mobileStatus'),
@@ -47,6 +48,14 @@ function connectEvents() {
 
   eventSource.addEventListener('error', () => {
     updateStatus({ ...currentState, status: 'reconnecting' });
+    fetch('/api/auth/status')
+      .then(response => response.json())
+      .then(status => {
+        if (status.authEnabled && !status.authenticated) {
+          location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;
+        }
+      })
+      .catch(() => {});
   });
 }
 
@@ -87,6 +96,11 @@ function wireUi() {
   elements.interruptButton.addEventListener('click', async () => {
     await postJson('/api/interrupt', {});
     closeMobileMenu();
+  });
+
+  elements.logoutButton.addEventListener('click', async () => {
+    await postJson('/api/logout', {});
+    location.href = '/login';
   });
 
   elements.menuButton.addEventListener('click', openMobileMenu);
@@ -178,8 +192,12 @@ async function postJson(url, payload) {
     body: JSON.stringify(payload),
   });
   const data = await response.json().catch(() => ({}));
+  if (response.status === 401 && data.authRequired) {
+    location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;
+    throw new Error('Login required');
+  }
   if (!response.ok || data.ok === false) {
-    throw new Error(data.error || `请求失败：${response.status}`);
+    throw new Error(data.error || `Request failed: ${response.status}`);
   }
   return data;
 }

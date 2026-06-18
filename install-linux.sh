@@ -107,6 +107,56 @@ display_url() {
   printf 'http://%s:%s' "$host" "$port"
 }
 
+
+listen_port() {
+  printf '%s' "${PORT_VALUE:-$(config_value server.port 3652)}"
+}
+
+find_port_pids() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser "$port/tcp" 2>/dev/null | tr ' ' '\n' || true
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltnp "sport = :$port" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltnp 2>/dev/null | awk -v port=":$port" '$4 ~ port"$" {print $7}' | cut -d/ -f1 || true
+  fi
+}
+
+process_belongs_to_app() {
+  local pid="$1"
+  local cwd=""
+  local cmdline=""
+  cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+  if [[ "$cwd" == "$APP_DIR" ]]; then
+    return 0
+  fi
+  cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *"$APP_DIR"* && "$cmdline" == *"server.js"* ]]
+}
+
+stop_orphan_listeners() {
+  local port pid
+  port="$(listen_port)"
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if [[ "$pid" == "$$" ]]; then
+      continue
+    fi
+    if process_belongs_to_app "$pid"; then
+      log "Stopping orphan listener PID $pid on port $port"
+      kill "$pid" 2>/dev/null || true
+      sleep 0.3
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    fi
+  done < <(find_port_pids "$port" | sort -u)
+}
+
 as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
     "$@"
@@ -207,6 +257,7 @@ stop_app() {
     rm -f "$PID_FILE"
     log "Not running"
   fi
+  stop_orphan_listeners
 }
 
 status_app() {
@@ -226,6 +277,7 @@ start_app() {
     log "URL: $(display_url)"
     exit 0
   fi
+  stop_orphan_listeners
 
   if [[ -n "$HOST_VALUE" ]]; then
     export HOST="$HOST_VALUE"
@@ -236,11 +288,11 @@ start_app() {
 
   if [[ "$FOREGROUND" -eq 1 ]]; then
     log "Starting in foreground at $(display_url)"
-    exec npm start
+    exec node src/server.js
   fi
 
   log "Starting in background at $(display_url)"
-  nohup npm start >"$LOG_DIR/app.log" 2>&1 &
+  nohup node src/server.js >"$LOG_DIR/app.log" 2>&1 &
   echo $! >"$PID_FILE"
   sleep 1
 

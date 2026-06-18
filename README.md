@@ -44,9 +44,53 @@ The script will:
 - check/install Node.js and npm with the system package manager when missing;
 - create `config.json` from `config.example.json` when missing;
 - run `npm install --omit=dev`;
-- start the app in the background with logs at `logs/app.log`.
+- start the app in the background with logs at `logs/app.log`;
+- on restart, clear old listeners from the same project directory that still hold the configured port.
 
 Before first real use, edit `config.json` and set `claude.apiKey` plus `claude.baseUrl` if you use a custom Anthropic-compatible gateway.
+
+
+## Access password and Google Authenticator
+
+The web UI can require a login before any page, API, or event stream is usable.
+Edit `config.json`:
+
+```json
+{
+  "auth": {
+    "enabled": true,
+    "password": "change-this-password",
+    "sessionHours": 12,
+    "totp": {
+      "enabled": true,
+      "secret": "BASE32_SECRET_FROM_GOOGLE_AUTHENTICATOR"
+    }
+  }
+}
+```
+
+When both `auth.password` and `auth.totp.enabled` are set, login requires both the
+static password and the 6-digit code from Google Authenticator / Microsoft
+Authenticator / 1Password / any TOTP app. If you want dynamic-code-only access,
+leave `auth.password` empty and enable TOTP with a secret.
+
+Generate a TOTP secret:
+
+```bash
+npm run totp:secret -- your-name@example.com
+```
+
+Copy the printed `secret` into `config.json`, then add it manually in Google
+Authenticator using the same secret. Restart the server after changing auth
+settings:
+
+```bash
+./install-linux.sh --restart
+```
+
+Optional environment overrides are also supported: `CWC_AUTH_ENABLED`,
+`CWC_AUTH_PASSWORD`, `CWC_AUTH_PASSWORD_SHA256`, `CWC_TOTP_ENABLED`, and
+`CWC_TOTP_SECRET`.
 
 ## Local config
 
@@ -57,6 +101,14 @@ Edit `config.json`. Values are injected only into the Claude CLI child process; 
   "server": {
     "host": "127.0.0.1",
     "port": 3652
+  },
+  "auth": {
+    "enabled": false,
+    "password": "",
+    "totp": {
+      "enabled": false,
+      "secret": ""
+    }
   },
   "claude": {
     "cwd": "..",
@@ -73,6 +125,9 @@ Edit `config.json`. Values are injected only into the Claude CLI child process; 
 
 Important fields:
 
+- `auth.enabled` -> require login before page/API/SSE access.
+- `auth.password` -> optional static access password.
+- `auth.totp.secret` -> base32 TOTP secret for Google Authenticator.
 - `claude.apiKey` -> injected as `ANTHROPIC_API_KEY`.
 - `claude.baseUrl` -> injected as `ANTHROPIC_BASE_URL`.
 - `claude.cwd` -> working directory Claude CLI can see; `..` means `E:\LittleTools` from this project.

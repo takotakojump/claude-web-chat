@@ -2,7 +2,13 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { randomUUID } = require('node:crypto');
+const {
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} = require('node:crypto');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
@@ -17,10 +23,14 @@ const CLAUDE_CWD = resolvePath(
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_EVENT_LOG = 800;
 const MAX_STDERR_LOG = 200;
+const SESSION_COOKIE = 'cwc_session';
+const AUTH = buildAuthConfig();
 
 const clients = new Set();
 const pendingInteractions = new Map();
 const stderrRing = [];
+const sessions = new Map();
+const loginAttempts = new Map();
 
 let eventLog = [];
 let claudeProcess = null;
@@ -43,6 +53,7 @@ let state = {
   configPath: CONFIG_PATH,
   hasApiKey: Boolean(getClaudeApiKey()),
   baseUrl: getClaudeBaseUrl() || null,
+  authEnabled: AUTH.enabled,
 };
 
 function loadConfig() {
@@ -75,11 +86,218 @@ function isTruthy(value) {
 }
 
 
+
 function firstNonEmpty(...values) {
   for (const value of values) {
     if (value !== undefined && value !== null && String(value) !== '') return value;
   }
   return undefined;
+}
+
+function buildAuthConfig() {
+  const enabled = isTruthy(firstNonEmpty(process.env.CWC_AUTH_ENABLED, getConfig('auth.enabled')));
+  const password = firstNonEmpty(process.env.CWC_AUTH_PASSWORD, getConfig('auth.password'));
+  const passwordSha256 = firstNonEmpty(
+    process.env.CWC_AUTH_PASSWORD_SHA256,
+    getConfig('auth.passwordSha256'),
+  );
+  const totpSecret = firstNonEmpty(
+    process.env.CWC_TOTP_SECRET,
+    getConfig('auth.totp.secret'),
+  );
+  const totpEnabled = isTruthy(
+    firstNonEmpty(process.env.CWC_TOTP_ENABLED, getConfig('auth.totp.enabled')),
+  );
+  const sessionHours = Number(firstNonEmpty(getConfig('auth.sessionHours'), 12));
+  const maxAttempts = Number(firstNonEmpty(getConfig('auth.maxAttemptsPerMinute'), 12));
+
+  return {
+    enabled,
+    password: password ? String(password) : '',
+    passwordSha256: passwordSha256 ? normalizeSha256(passwordSha256) : '',
+    totp: {
+      enabled: totpEnabled,
+      secret: totpSecret ? String(totpSecret) : '',
+      period: Number(firstNonEmpty(getConfig('auth.totp.period'), 30)),
+      digits: Number(firstNonEmpty(getConfig('auth.totp.digits'), 6)),
+      window: Number(firstNonEmpty(getConfig('auth.totp.window'), 1)),
+    },
+    sessionMs: Math.max(1, sessionHours) * 60 * 60 * 1000,
+    maxAttempts: Math.max(3, maxAttempts),
+    cookieSecure: isTruthy(getConfig('auth.cookieSecure')),
+  };
+}
+
+function normalizeSha256(value) {
+  return String(value).trim().replace(/^sha256:/i, '').toLowerCase();
+}
+
+function authPasswordConfigured() {
+  return Boolean(AUTH.password || AUTH.passwordSha256);
+}
+
+function authTotpConfigured() {
+  return Boolean(AUTH.totp.enabled && AUTH.totp.secret);
+}
+
+function authReady() {
+  if (!AUTH.enabled) return true;
+  return authPasswordConfigured() || authTotpConfigured();
+}
+
+function sha256Hex(value) {
+  return createHash('sha256').update(String(value)).digest('hex');
+}
+
+function safeEqualString(a, b) {
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+function verifyPassword(input) {
+  if (!authPasswordConfigured()) return true;
+  const candidate = String(input || '');
+  if (AUTH.passwordSha256) {
+    return safeEqualString(sha256Hex(candidate), AUTH.passwordSha256);
+  }
+  return safeEqualString(sha256Hex(candidate), sha256Hex(AUTH.password));
+}
+
+function base32Decode(secret) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const normalized = String(secret || '').toUpperCase().replace(/[=\s-]/g, '');
+  let bits = '';
+  const bytes = [];
+  for (const char of normalized) {
+    const value = alphabet.indexOf(char);
+    if (value < 0) throw new Error('Invalid TOTP secret. Use RFC4648 base32.');
+    bits += value.toString(2).padStart(5, '0');
+    while (bits.length >= 8) {
+      bytes.push(Number.parseInt(bits.slice(0, 8), 2));
+      bits = bits.slice(8);
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function hotp(secret, counter, digits) {
+  const key = base32Decode(secret);
+  const buffer = Buffer.alloc(8);
+  buffer.writeBigUInt64BE(BigInt(counter));
+  const hmac = createHmac('sha1', key).update(buffer).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const code =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+  return String(code % 10 ** digits).padStart(digits, '0');
+}
+
+function verifyTotp(input) {
+  if (!authTotpConfigured()) return true;
+  const code = String(input || '').replace(/\s/g, '');
+  if (!new RegExp(`^\\d{${AUTH.totp.digits}}$`).test(code)) return false;
+  const currentCounter = Math.floor(Date.now() / 1000 / AUTH.totp.period);
+  for (let offset = -AUTH.totp.window; offset <= AUTH.totp.window; offset += 1) {
+    const counter = currentCounter + offset;
+    if (counter < 0) continue;
+    if (safeEqualString(hotp(AUTH.totp.secret, counter, AUTH.totp.digits), code)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parseCookies(req) {
+  const cookies = {};
+  const header = req.headers.cookie || '';
+  for (const part of header.split(';')) {
+    const index = part.indexOf('=');
+    if (index < 0) continue;
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    if (key) cookies[key] = decodeURIComponent(value);
+  }
+  return cookies;
+}
+
+function createSessionCookie(req) {
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = Date.now() + AUTH.sessionMs;
+  sessions.set(token, { expiresAt, ip: clientIp(req) });
+  return buildCookie(SESSION_COOKIE, token, {
+    maxAge: Math.floor(AUTH.sessionMs / 1000),
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: AUTH.cookieSecure,
+  });
+}
+
+function clearSessionCookie() {
+  return buildCookie(SESSION_COOKIE, '', {
+    maxAge: 0,
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: AUTH.cookieSecure,
+  });
+}
+
+function buildCookie(name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`, 'Path=/'];
+  if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.httpOnly) parts.push('HttpOnly');
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  if (options.secure) parts.push('Secure');
+  return parts.join('; ');
+}
+
+function isAuthenticated(req) {
+  if (!AUTH.enabled) return true;
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (!token) return false;
+  const session = sessions.get(token);
+  if (!session) return false;
+  if (session.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function clientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded) return forwarded.split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function checkLoginRateLimit(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  const bucket = loginAttempts.get(ip) || [];
+  const recent = bucket.filter(timestamp => now - timestamp < 60_000);
+  recent.push(now);
+  loginAttempts.set(ip, recent);
+  return recent.length <= AUTH.maxAttempts;
+}
+
+function verifyAuthPayload(body) {
+  if (!authReady()) {
+    return { ok: false, error: 'Auth is enabled but no password or TOTP secret is configured.' };
+  }
+  if (!verifyPassword(body.password)) {
+    return { ok: false, error: 'Invalid password or verification code.' };
+  }
+  try {
+    if (!verifyTotp(body.totp)) {
+      return { ok: false, error: 'Invalid password or verification code.' };
+    }
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  return { ok: true };
 }
 
 function toArgArray(value) {
@@ -931,12 +1149,190 @@ async function readJsonBody(req) {
   return JSON.parse(body);
 }
 
-function jsonResponse(res, statusCode, payload) {
+function jsonResponse(res, statusCode, payload, headers = {}) {
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
+    ...headers,
   });
   res.end(JSON.stringify(payload));
+}
+
+
+function htmlResponse(res, statusCode, body, headers = {}) {
+  res.writeHead(statusCode, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+    ...headers,
+  });
+  res.end(body);
+}
+
+function redirectResponse(res, location, headers = {}) {
+  res.writeHead(302, {
+    location,
+    'cache-control': 'no-store',
+    ...headers,
+  });
+  res.end();
+}
+
+function handleUnauthorized(req, res, url) {
+  if (!AUTH.enabled || isAuthenticated(req)) return true;
+  if (url.pathname.startsWith('/api/')) {
+    jsonResponse(res, 401, {
+      ok: false,
+      authRequired: true,
+      error: 'Authentication required.',
+    });
+    return false;
+  }
+  const next = encodeURIComponent(`${url.pathname}${url.search}`);
+  redirectResponse(res, `/login?next=${next}`);
+  return false;
+}
+
+async function handleAuthRoutes(req, res, url) {
+  try {
+    if (req.method === 'GET' && url.pathname === '/api/auth/status') {
+    jsonResponse(res, 200, {
+      ok: true,
+      authEnabled: AUTH.enabled,
+      authenticated: isAuthenticated(req),
+      passwordEnabled: authPasswordConfigured(),
+      totpEnabled: authTotpConfigured(),
+      authReady: authReady(),
+    });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/login') {
+    if (!AUTH.enabled || isAuthenticated(req)) {
+      redirectResponse(res, safeNextPath(url.searchParams.get('next')) || '/');
+      return true;
+    }
+    htmlResponse(res, 200, renderLoginPage());
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/login') {
+    if (!AUTH.enabled) {
+      jsonResponse(res, 200, { ok: true });
+      return true;
+    }
+    if (!checkLoginRateLimit(req)) {
+      jsonResponse(res, 429, { ok: false, error: 'Too many login attempts. Try again later.' });
+      return true;
+    }
+    const body = await readJsonBody(req);
+    const result = verifyAuthPayload(body);
+    if (!result.ok) {
+      jsonResponse(res, 401, { ok: false, error: result.error });
+      return true;
+    }
+    jsonResponse(res, 200, { ok: true }, { 'set-cookie': createSessionCookie(req) });
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/logout') {
+    const token = parseCookies(req)[SESSION_COOKIE];
+    if (token) sessions.delete(token);
+    jsonResponse(res, 200, { ok: true }, { 'set-cookie': clearSessionCookie() });
+    return true;
+  }
+
+    return false;
+  } catch (error) {
+    jsonResponse(res, 400, { ok: false, error: error.message });
+    return true;
+  }
+}
+
+function safeNextPath(next) {
+  if (!next || typeof next !== 'string') return '';
+  if (!next.startsWith('/') || next.startsWith('//')) return '';
+  return next;
+}
+
+function renderLoginPage() {
+  const passwordField = authPasswordConfigured()
+    ? `<label>Password<input name="password" type="password" autocomplete="current-password" autofocus /></label>`
+    : '';
+  const totpField = authTotpConfigured()
+    ? `<label>Authenticator code<input name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" placeholder="000000" ${passwordField ? '' : 'autofocus'} /></label>`
+    : '';
+  const setupWarning = authReady()
+    ? ''
+    : `<div class="warning">Auth is enabled, but no password or TOTP secret is configured. Edit config.json.</div>`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Claude Web Chat Login</title>
+  <style>
+    :root { color-scheme: light; --ink:#251b14; --muted:#76695c; --accent:#a8451f; --paper:#fffaf2; --line:rgba(72,48,31,.16); }
+    * { box-sizing: border-box; }
+    body { min-height: 100dvh; margin: 0; display: grid; place-items: center; padding: 24px; color: var(--ink); font-family: Aptos, "Trebuchet MS", sans-serif; background: radial-gradient(circle at 18% 10%, rgba(228,141,91,.25), transparent 28rem), linear-gradient(135deg,#fbf3e7,#ead8c4); }
+    main { width: min(430px, 100%); padding: 30px; border: 1px solid var(--line); border-radius: 30px; background: rgba(255,250,242,.88); box-shadow: 0 28px 80px rgba(87,58,32,.16); backdrop-filter: blur(20px); }
+    .mark { display: grid; place-items: center; width: 54px; height: 54px; border-radius: 18px; color: #fff8ee; font: 700 30px Georgia, serif; background: linear-gradient(145deg,#cc6532,#7e462d); }
+    h1 { margin: 18px 0 8px; font: 700 34px Georgia, serif; letter-spacing: -.04em; }
+    p { margin: 0 0 22px; color: var(--muted); line-height: 1.55; }
+    form { display: grid; gap: 14px; }
+    label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; font-weight: 850; }
+    input { width: 100%; min-height: 48px; padding: 11px 13px; border: 1px solid var(--line); border-radius: 16px; outline: none; color: var(--ink); background: rgba(255,255,255,.68); font: inherit; }
+    input:focus { border-color: rgba(168,69,31,.55); box-shadow: 0 0 0 4px rgba(168,69,31,.1); }
+    button { min-height: 48px; border: 0; border-radius: 999px; color: #fff8ee; background: var(--accent); font-weight: 900; cursor: pointer; }
+    button:disabled { opacity: .65; cursor: wait; }
+    .error, .warning { display: none; padding: 11px 13px; border-radius: 14px; color: #a93628; background: rgba(169,54,40,.1); line-height: 1.45; }
+    .warning { display: block; margin-bottom: 14px; }
+    .hint { margin-top: 14px; color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark">C</div>
+    <h1>Sign in</h1>
+    <p>Enter the access password and/or Google Authenticator code configured for this local Claude Web Chat.</p>
+    ${setupWarning}
+    <form id="loginForm">
+      ${passwordField}
+      ${totpField}
+      <div class="error" id="errorBox"></div>
+      <button type="submit">Unlock</button>
+    </form>
+    <div class="hint">Sessions are stored in an HttpOnly local cookie.</div>
+  </main>
+  <script>
+    const form = document.getElementById('loginForm');
+    const errorBox = document.getElementById('errorBox');
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      errorBox.style.display = 'none';
+      const button = form.querySelector('button');
+      button.disabled = true;
+      const data = Object.fromEntries(new FormData(form).entries());
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || payload.ok === false) throw new Error(payload.error || 'Login failed.');
+        const next = new URLSearchParams(location.search).get('next') || '/';
+        location.href = next.startsWith('/') && !next.startsWith('//') ? next : '/';
+      } catch (error) {
+        errorBox.textContent = error.message;
+        errorBox.style.display = 'block';
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>`;
 }
 
 async function handleApi(req, res, url) {
@@ -1067,6 +1463,8 @@ function mimeType(filePath) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || `${HOST}:${PORT}`}`);
+  if (await handleAuthRoutes(req, res, url)) return;
+  if (!handleUnauthorized(req, res, url)) return;
   if (await handleApi(req, res, url)) return;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405);
