@@ -22,11 +22,13 @@ cd claude-web-chat
 ./install-linux.sh
 ```
 
-For LAN/mobile access from another device, listen on all interfaces:
+For LAN/mobile access from another device, either set `server.host` to `0.0.0.0` in `config.json`, or override it for one launch:
 
 ```bash
 ./install-linux.sh --host 0.0.0.0 --port 3652
 ```
+
+When `--host` / `--port` are not provided, the script respects `config.json`. Environment variables `HOST` and `PORT` still take precedence if you set them explicitly.
 
 Useful commands:
 
@@ -76,6 +78,7 @@ Important fields:
 - `claude.cwd` -> working directory Claude CLI can see; `..` means `E:\LittleTools` from this project.
 - `claude.command` -> optional full Claude executable path; leave empty to auto-detect `claude.cmd`.
 - `claude.extraArgs` -> extra Claude CLI flags, for example `["--model", "sonnet"]` if needed.
+- `server.host` -> bind address; use `0.0.0.0` for LAN/mobile access.
 - `server.port` -> defaults to `3652`.
 
 `config.json` is ignored by git because it can contain secrets. Use `config.example.json` as a template.

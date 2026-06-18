@@ -6,8 +6,8 @@ LOG_DIR="$APP_DIR/logs"
 PID_FILE="$APP_DIR/claude-web-chat.pid"
 CONFIG_FILE="$APP_DIR/config.json"
 EXAMPLE_CONFIG="$APP_DIR/config.example.json"
-HOST_VALUE="${HOST:-127.0.0.1}"
-PORT_VALUE="${PORT:-3652}"
+HOST_VALUE="${HOST:-}"
+PORT_VALUE="${PORT:-}"
 MODE="start"
 FOREGROUND=0
 
@@ -19,8 +19,8 @@ Installs runtime dependencies, creates config.json when missing, and starts
 Claude Web Chat on Linux.
 
 Options:
-  --host HOST        Host to listen on for this launch (default: 127.0.0.1)
-  --port PORT        Port to listen on for this launch (default: 3652)
+  --host HOST        Override config.json server.host for this launch
+  --port PORT        Override config.json server.port for this launch
   --foreground       Run in the foreground instead of using nohup
   --restart          Stop an existing background process, then start it
   --stop             Stop the background process recorded in claude-web-chat.pid
@@ -31,6 +31,8 @@ Examples:
   ./install-linux.sh
   ./install-linux.sh --host 0.0.0.0 --port 3652
   ./install-linux.sh --restart
+
+Without --host/--port, config.json controls the bind address and port.
 USAGE
 }
 
@@ -74,6 +76,35 @@ done
 
 log() {
   printf '[claude-web-chat] %s\n' "$*"
+}
+
+config_value() {
+  local key="$1"
+  local fallback="$2"
+  if command -v node >/dev/null 2>&1 && [[ -f "$CONFIG_FILE" ]]; then
+    node -e '
+const fs = require("fs");
+const file = process.argv[1];
+const key = process.argv[2];
+const fallback = process.argv[3] || "";
+let config = {};
+try { config = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+const value = key.split(".").reduce((obj, part) => {
+  if (!obj || typeof obj !== "object") return undefined;
+  return Object.prototype.hasOwnProperty.call(obj, part) ? obj[part] : undefined;
+}, config);
+process.stdout.write(value === undefined || value === null || String(value) === "" ? fallback : String(value));
+' "$CONFIG_FILE" "$key" "$fallback"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+display_url() {
+  local host port
+  host="${HOST_VALUE:-$(config_value server.host 127.0.0.1)}"
+  port="${PORT_VALUE:-$(config_value server.port 3652)}"
+  printf 'http://%s:%s' "$host" "$port"
 }
 
 as_root() {
@@ -181,7 +212,7 @@ stop_app() {
 status_app() {
   if is_running; then
     log "Running with PID $(cat "$PID_FILE")"
-    log "URL: http://$HOST_VALUE:$PORT_VALUE"
+    log "URL: $(display_url)"
   else
     log "Not running"
   fi
@@ -192,19 +223,23 @@ start_app() {
   mkdir -p "$LOG_DIR"
   if is_running; then
     log "Already running with PID $(cat "$PID_FILE")"
-    log "URL: http://$HOST_VALUE:$PORT_VALUE"
+    log "URL: $(display_url)"
     exit 0
   fi
 
-  export HOST="$HOST_VALUE"
-  export PORT="$PORT_VALUE"
+  if [[ -n "$HOST_VALUE" ]]; then
+    export HOST="$HOST_VALUE"
+  fi
+  if [[ -n "$PORT_VALUE" ]]; then
+    export PORT="$PORT_VALUE"
+  fi
 
   if [[ "$FOREGROUND" -eq 1 ]]; then
-    log "Starting in foreground at http://$HOST:$PORT"
+    log "Starting in foreground at $(display_url)"
     exec npm start
   fi
 
-  log "Starting in background at http://$HOST:$PORT"
+  log "Starting in background at $(display_url)"
   nohup npm start >"$LOG_DIR/app.log" 2>&1 &
   echo $! >"$PID_FILE"
   sleep 1
