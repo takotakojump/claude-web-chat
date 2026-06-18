@@ -114,6 +114,8 @@ Edit `config.json`. Values are injected only into the Claude CLI child process; 
     "cwd": "..",
     "apiKey": "sk-ant-...",
     "baseUrl": "https://your-anthropic-compatible-gateway.example.com",
+    "configDir": "",
+    "sessionDir": "",
     "model": "",
     "extraArgs": [],
     "skipPermissions": false,
@@ -133,10 +135,41 @@ Important fields:
 - `claude.cwd` -> working directory Claude CLI can see; `..` means `E:\LittleTools` from this project.
 - `claude.command` -> optional full Claude executable path; leave empty to auto-detect `claude.cmd`.
 - `claude.extraArgs` -> extra Claude CLI flags, for example `["--model", "sonnet"]` if needed.
+- `claude.configDir` -> Claude config directory, default `~/.claude`.
+- `claude.sessionDir` -> optional explicit session directory override.
 - `server.host` -> bind address; use `0.0.0.0` for LAN/mobile access.
 - `server.port` -> defaults to `3652`.
 
 `config.json` is ignored by git because it can contain secrets. Use `config.example.json` as a template.
+
+
+## Claude session history
+
+Claude Code stores local project transcripts under `~/.claude/projects/<encoded-cwd>/`.
+Claude Web Chat now shows those sessions in the sidebar for the configured
+`claude.cwd` project.
+
+From the sidebar you can:
+
+- refresh the session list;
+- load a historical session into the chat view;
+- continue chatting from the loaded Claude session on the next message;
+- delete one session (`<session>.jsonl` plus its same-name sidecar directory);
+- clear all sessions for the current configured project.
+
+By default the session directory is derived from `claude.cwd`. Advanced overrides:
+
+```json
+{
+  "claude": {
+    "configDir": "~/.claude",
+    "sessionDir": ""
+  }
+}
+```
+
+Set `claude.sessionDir` only if your Claude CLI stores sessions somewhere custom.
+The app refuses to delete outside the resolved session directory.
 
 ## Interactions
 

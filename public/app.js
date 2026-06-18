@@ -9,6 +9,9 @@ const elements = {
   startButton: document.getElementById('startButton'),
   interruptButton: document.getElementById('interruptButton'),
   logoutButton: document.getElementById('logoutButton'),
+  refreshSessionsButton: document.getElementById('refreshSessionsButton'),
+  clearSessionsButton: document.getElementById('clearSessionsButton'),
+  sessionList: document.getElementById('sessionList'),
   statusDot: document.getElementById('statusDot'),
   statusText: document.getElementById('statusText'),
   mobileStatus: document.getElementById('mobileStatus'),
@@ -40,6 +43,7 @@ function connectEvents() {
     for (const item of snapshot.events || []) applyEvent(item);
     for (const interaction of snapshot.pendingInteractions || []) renderInteraction(interaction);
     scrollMessages();
+    refreshSessions();
   });
 
   eventSource.addEventListener('event', event => {
@@ -82,9 +86,21 @@ function wireUi() {
     elements.promptInput.focus();
   });
 
+  elements.sessionList.addEventListener('click', async event => {
+    const loadButton = event.target.closest('[data-session-load]');
+    const deleteButton = event.target.closest('[data-session-delete]');
+    try {
+      if (loadButton) await loadSession(loadButton.dataset.sessionLoad);
+      if (deleteButton) await deleteSession(deleteButton.dataset.sessionDelete);
+    } catch (error) {
+      renderSystem({ level: 'error', text: error.message });
+    }
+  });
+
   elements.newChatButton.addEventListener('click', async () => {
     if (!confirm('开始新对话？当前网页里的消息会清空，Claude CLI 会重启。')) return;
     await postJson('/api/restart', {});
+    await refreshSessions();
     closeMobileMenu();
   });
 
@@ -101,6 +117,16 @@ function wireUi() {
   elements.logoutButton.addEventListener('click', async () => {
     await postJson('/api/logout', {});
     location.href = '/login';
+  });
+
+  elements.refreshSessionsButton.addEventListener('click', () => {
+    refreshSessions();
+  });
+
+  elements.clearSessionsButton.addEventListener('click', async () => {
+    if (!confirm('Clear all Claude sessions for the current project? This cannot be undone.')) return;
+    await postJson('/api/sessions/clear', {});
+    await refreshSessions();
   });
 
   elements.menuButton.addEventListener('click', openMobileMenu);
@@ -200,6 +226,102 @@ async function postJson(url, payload) {
     throw new Error(data.error || `Request failed: ${response.status}`);
   }
   return data;
+}
+
+
+async function getJson(url) {
+  const response = await fetch(url);
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401 && data.authRequired) {
+    location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;
+    throw new Error('Login required');
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(data.error || `Request failed: ${response.status}`);
+  }
+  return data;
+}
+
+async function deleteJson(url) {
+  const response = await fetch(url, { method: 'DELETE' });
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401 && data.authRequired) {
+    location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;
+    throw new Error('Login required');
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(data.error || `Request failed: ${response.status}`);
+  }
+  return data;
+}
+
+async function refreshSessions() {
+  if (!elements.sessionList) return;
+  try {
+    const data = await getJson('/api/sessions');
+    renderSessionList(data.sessions || []);
+  } catch (error) {
+    elements.sessionList.innerHTML = `<p class="muted-small">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderSessionList(sessions) {
+  if (!elements.sessionList) return;
+  if (!sessions.length) {
+    elements.sessionList.innerHTML = '<p class="muted-small">No Claude sessions found.</p>';
+    return;
+  }
+  elements.sessionList.innerHTML = '';
+  for (const session of sessions.slice(0, 50)) {
+    const item = document.createElement('div');
+    item.className = 'session-item';
+    item.innerHTML = `
+      <div class="session-title">
+        <span>${escapeHtml(shortId(session.id))}</span>
+        <span>${escapeHtml(formatBytes(session.size || 0))}</span>
+      </div>
+      <p class="session-preview">${escapeHtml(session.preview || 'No preview')}</p>
+      <p class="muted-small">${escapeHtml(formatDate(session.updatedAt))}</p>
+      <div class="session-actions">
+        <button type="button" data-session-load="${escapeAttribute(session.id)}">Load</button>
+        <button type="button" class="danger" data-session-delete="${escapeAttribute(session.id)}">Delete</button>
+      </div>
+    `;
+    elements.sessionList.appendChild(item);
+  }
+}
+
+async function loadSession(id) {
+  await postJson(`/api/sessions/${encodeURIComponent(id)}/load`, {});
+  await refreshSessions();
+  closeMobileMenu();
+}
+
+async function deleteSession(id) {
+  if (!confirm(`Delete Claude session ${shortId(id)}? This cannot be undone.`)) return;
+  await deleteJson(`/api/sessions/${encodeURIComponent(id)}`);
+  await refreshSessions();
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatDate(value) {
+  if (!value) return '';
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(value));
+  } catch {
+    return String(value);
+  }
 }
 
 function ensureMessage(data) {

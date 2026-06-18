@@ -37,6 +37,7 @@ let claudeProcess = null;
 let stdoutBuffer = '';
 let stderrBuffer = '';
 let activeAssistantId = null;
+let activeResumeSessionId = null;
 let intentionalStop = false;
 let state = {
   running: false,
@@ -44,6 +45,7 @@ let state = {
   status: 'idle',
   pid: null,
   sessionId: null,
+  loadedSessionId: null,
   model: null,
   cwd: CLAUDE_CWD,
   command: resolveClaudeCommand(),
@@ -411,6 +413,297 @@ function splitArgs(input) {
   return args;
 }
 
+
+function expandHome(value) {
+  const text = String(value || '');
+  if (text === '~') return getHomeDir();
+  if (text.startsWith('~/') || text.startsWith('~\\')) {
+    return path.join(getHomeDir(), text.slice(2));
+  }
+  return text;
+}
+
+function getHomeDir() {
+  return process.env.HOME || process.env.USERPROFILE || process.cwd();
+}
+
+function encodeClaudeProjectPath(dir) {
+  return path.resolve(dir).replace(/[:\\/]/g, '-');
+}
+
+function getClaudeSessionDir() {
+  const configured = firstNonEmpty(
+    process.env.CLAUDE_SESSION_DIR,
+    getConfig('claude.sessionDir'),
+  );
+  if (configured) {
+    const expanded = expandHome(configured);
+    return path.resolve(ROOT_DIR, expanded);
+  }
+  const claudeHome = path.resolve(
+    expandHome(firstNonEmpty(process.env.CLAUDE_CONFIG_DIR, getConfig('claude.configDir'), '~/.claude')),
+  );
+  return path.join(claudeHome, 'projects', encodeClaudeProjectPath(CLAUDE_CWD));
+}
+
+function assertInside(baseDir, targetPath) {
+  const base = path.resolve(baseDir);
+  const target = path.resolve(targetPath);
+  if (target !== base && !target.startsWith(base + path.sep)) {
+    throw new Error('Refusing to access a path outside the Claude session directory.');
+  }
+  return target;
+}
+
+function safeSessionId(id) {
+  const value = String(id || '').trim();
+  if (!/^[a-zA-Z0-9._-]+$/.test(value) || value.includes('..')) {
+    throw new Error('Invalid session id.');
+  }
+  return value.replace(/\.jsonl$/i, '');
+}
+
+function sessionFilePreview(filePath) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buffer = Buffer.alloc(Math.min(256 * 1024, fs.statSync(filePath).size));
+      fs.readSync(fd, buffer, 0, buffer.length, 0);
+      const lines = buffer.toString('utf8').split(/\r?\n/).slice(0, 80);
+      for (const line of lines) {
+        const cleanLine = line.replace(/^\uFEFF/, '');
+        if (!cleanLine.trim()) continue;
+        const parsed = JSON.parse(cleanLine);
+        const message = parsed.message || parsed;
+        if (message.role === 'user' || parsed.type === 'user') {
+          const text = extractMessageText(message.content || message.message?.content);
+          if (text) return truncateText(text, 120);
+        }
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // Preview is best-effort only; listing should still work for malformed files.
+  }
+  return '';
+}
+
+function extractMessageText(content) {
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content
+    .map(part => {
+      if (!part || typeof part !== 'object') return '';
+      if (typeof part.text === 'string') return part.text;
+      if (typeof part.content === 'string') return part.content;
+      return '';
+    })
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+}
+
+function truncateText(text, maxLength) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized;
+}
+
+function listClaudeSessions() {
+  const dir = getClaudeSessionDir();
+  const resolvedDir = path.resolve(dir);
+  const result = {
+    cwd: CLAUDE_CWD,
+    dir: resolvedDir,
+    exists: fs.existsSync(resolvedDir),
+    sessions: [],
+    totalCount: 0,
+    totalBytes: 0,
+  };
+  if (!result.exists) return result;
+
+  const entries = fs.readdirSync(resolvedDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+    const filePath = assertInside(resolvedDir, path.join(resolvedDir, entry.name));
+    const stat = fs.statSync(filePath);
+    const id = entry.name.slice(0, -'.jsonl'.length);
+    const sidecarDir = path.join(resolvedDir, id);
+    const sidecarExists = fs.existsSync(sidecarDir) && fs.statSync(sidecarDir).isDirectory();
+    result.totalBytes += stat.size;
+    result.sessions.push({
+      id,
+      filename: entry.name,
+      size: stat.size,
+      updatedAt: stat.mtime.toISOString(),
+      createdAt: stat.birthtime.toISOString(),
+      preview: sessionFilePreview(filePath),
+      sidecarExists,
+    });
+  }
+  result.sessions.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  result.totalCount = result.sessions.length;
+  return result;
+}
+
+function deleteClaudeSession(id) {
+  const sessionId = safeSessionId(id);
+  const dir = getClaudeSessionDir();
+  const resolvedDir = path.resolve(dir);
+  const targets = [
+    path.join(resolvedDir, `${sessionId}.jsonl`),
+    path.join(resolvedDir, sessionId),
+  ].map(target => assertInside(resolvedDir, target));
+
+  let deleted = 0;
+  for (const target of targets) {
+    if (fs.existsSync(target)) {
+      fs.rmSync(target, { recursive: true, force: true });
+      deleted += 1;
+    }
+  }
+  return { id: sessionId, deleted };
+}
+
+function clearClaudeSessions() {
+  const listing = listClaudeSessions();
+  let deleted = 0;
+  for (const session of listing.sessions) {
+    deleted += deleteClaudeSession(session.id).deleted;
+  }
+  return { deletedSessions: listing.sessions.length, deletedTargets: deleted, dir: listing.dir };
+}
+
+function getClaudeSessionFile(sessionId) {
+  const id = safeSessionId(sessionId);
+  const dir = path.resolve(getClaudeSessionDir());
+  const filePath = assertInside(dir, path.join(dir, `${id}.jsonl`));
+  if (!fs.existsSync(filePath)) throw new Error('Session file not found.');
+  return { id, dir, filePath };
+}
+
+function parseClaudeSession(sessionId) {
+  const { id, dir, filePath } = getClaudeSessionFile(sessionId);
+  const stat = fs.statSync(filePath);
+  const messages = [];
+  const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+  for (const line of lines) {
+    const cleanLine = line.replace(/^\uFEFF/, '');
+    if (!cleanLine.trim()) continue;
+    let entry;
+    try {
+      entry = JSON.parse(cleanLine);
+    } catch {
+      continue;
+    }
+    if (entry.isSidechain) continue;
+    if (entry.type !== 'user' && entry.type !== 'assistant') continue;
+    const message = entry.message || {};
+    const role = message.role || entry.type;
+    if (role !== 'user' && role !== 'assistant') continue;
+
+    if (role === 'user') {
+      const text = extractUserHistoryText(message.content);
+      if (!text) continue;
+      messages.push({
+        id: entry.uuid || randomUUID(),
+        role: 'user',
+        text,
+        blocks: [],
+        status: 'done',
+        timestamp: entry.timestamp || null,
+      });
+      continue;
+    }
+
+    const extracted = extractContentBlocks(message.content);
+    if (!extracted.text && extracted.blocks.length === 0) continue;
+    messages.push({
+      id: entry.uuid || message.id || randomUUID(),
+      role: 'assistant',
+      text: extracted.text,
+      blocks: extracted.blocks,
+      status: 'done',
+      timestamp: entry.timestamp || null,
+    });
+  }
+
+  return {
+    id,
+    dir,
+    file: filePath,
+    size: stat.size,
+    updatedAt: stat.mtime.toISOString(),
+    messages,
+  };
+}
+
+function extractUserHistoryText(content) {
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  const textParts = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    if (part.type === 'text' && typeof part.text === 'string') textParts.push(part.text);
+    if (typeof part.content === 'string' && part.type !== 'tool_result') textParts.push(part.content);
+  }
+  return textParts.join('\n').trim();
+}
+
+function terminateClaudeProcess(reason) {
+  if (!claudeProcess) return;
+  intentionalStop = true;
+  const child = claudeProcess;
+  claudeProcess = null;
+  activeAssistantId = null;
+  for (const interaction of pendingInteractions.values()) {
+    emit('interaction_resolved', {
+      id: interaction.id,
+      status: 'cancelled',
+      label: reason || 'Claude CLI stopped',
+    });
+  }
+  pendingInteractions.clear();
+  if (process.platform === 'win32' && child.pid) {
+    spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+  } else {
+    child.kill('SIGTERM');
+  }
+  updateState({ running: false, busy: false, status: 'idle', pid: null, startedAt: null });
+}
+
+function emitHistoryMessages(history) {
+  eventLog = [];
+  activeAssistantId = null;
+  emit('reset', {});
+  for (const message of history.messages) {
+    emit('message_new', message);
+  }
+  emit('system', {
+    level: 'info',
+    text: `Loaded Claude session ${history.id}`,
+    detail: `${history.messages.length} messages`,
+  });
+}
+
+function loadClaudeSession(sessionId) {
+  const history = parseClaudeSession(sessionId);
+  terminateClaudeProcess('Switching Claude session');
+  activeResumeSessionId = history.id;
+  emitHistoryMessages(history);
+  updateState({
+    sessionId: history.id,
+    loadedSessionId: history.id,
+    busy: false,
+    status: 'history_loaded',
+    lastResult: null,
+  });
+  return history;
+}
+
 function buildClaudeArgs() {
   const args = [
     '--print',
@@ -434,6 +727,7 @@ function buildClaudeArgs() {
     process.env.CLAUDE_SYSTEM_PROMPT,
     getConfig('claude.appendSystemPrompt'),
   );
+  if (activeResumeSessionId) args.push('--resume', activeResumeSessionId);
   if (model) args.push('--model', String(model));
   if (agent) args.push('--agent', String(agent));
   if (systemPrompt) args.push('--append-system-prompt', String(systemPrompt));
@@ -486,6 +780,7 @@ function startClaude() {
   state.hasApiKey = Boolean(getClaudeApiKey());
   state.baseUrl = getClaudeBaseUrl() || null;
   state.skipPermissions = getSkipPermissions();
+  state.loadedSessionId = activeResumeSessionId;
 
   updateState({ status: 'starting', running: false, pid: null, startedAt: null });
   emit('system', {
@@ -576,12 +871,14 @@ function resetConversation() {
   pendingInteractions.clear();
   stderrRing.length = 0;
   activeAssistantId = null;
+  activeResumeSessionId = null;
   state = {
     ...state,
     busy: false,
     status: claudeProcess ? 'ready' : 'idle',
     lastResult: null,
     sessionId: null,
+    loadedSessionId: null,
   };
   emit('reset', {});
   updateState(state);
@@ -1337,6 +1634,49 @@ function renderLoginPage() {
 
 async function handleApi(req, res, url) {
   try {
+    if (url.pathname === '/api/sessions' && req.method === 'GET') {
+      jsonResponse(res, 200, { ok: true, ...listClaudeSessions() });
+      return true;
+    }
+
+    if (url.pathname === '/api/sessions/clear' && req.method === 'POST') {
+      terminateClaudeProcess('Clearing Claude sessions');
+      activeResumeSessionId = null;
+      const result = clearClaudeSessions();
+      resetConversation();
+      jsonResponse(res, 200, { ok: true, ...result });
+      return true;
+    }
+
+    const sessionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)(?:\/(load))?$/);
+    if (sessionMatch) {
+      const sessionId = decodeURIComponent(sessionMatch[1]);
+      const action = sessionMatch[2] || '';
+      if (req.method === 'GET' && !action) {
+        const history = parseClaudeSession(sessionId);
+        jsonResponse(res, 200, { ok: true, session: history });
+        return true;
+      }
+      if (req.method === 'POST' && action === 'load') {
+        const history = loadClaudeSession(sessionId);
+        jsonResponse(res, 200, { ok: true, session: history });
+        return true;
+      }
+      if (req.method === 'DELETE' && !action) {
+        const id = safeSessionId(sessionId);
+        if (id === activeResumeSessionId || id === state.sessionId) {
+          terminateClaudeProcess('Deleting active Claude session');
+          activeResumeSessionId = null;
+          resetConversation();
+        }
+        const result = deleteClaudeSession(id);
+        jsonResponse(res, 200, { ok: true, ...result });
+        return true;
+      }
+      jsonResponse(res, 405, { ok: false, error: 'Unsupported session operation.' });
+      return true;
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/status') {
       jsonResponse(res, 200, { ok: true, state, pending: Array.from(pendingInteractions.keys()) });
       return true;
@@ -1397,7 +1737,7 @@ async function handleApi(req, res, url) {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/restart') {
-      stopClaude();
+      terminateClaudeProcess('Starting a new chat');
       resetConversation();
       jsonResponse(res, 200, { ok: true });
       return true;

@@ -31,6 +31,8 @@
     "extraArgs": [],
     "skipPermissions": false,
     "bare": false,
-    "env": {}
+    "env": {},
+    "sessionDir": "",
+    "configDir": ""
   }
 }
