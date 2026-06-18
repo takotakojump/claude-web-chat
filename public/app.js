@@ -21,6 +21,7 @@ const elements = {
   cwdText: document.getElementById('cwdText'),
   sidebar: document.getElementById('sidebar'),
   menuButton: document.getElementById('menuButton'),
+  closeMenuButton: document.getElementById('closeMenuButton'),
   mobileBackdrop: document.getElementById('mobileBackdrop'),
 };
 
@@ -129,8 +130,15 @@ function wireUi() {
     await refreshSessions();
   });
 
-  elements.menuButton.addEventListener('click', openMobileMenu);
+  elements.menuButton.addEventListener('click', toggleMobileMenu);
+  elements.closeMenuButton.addEventListener('click', closeMobileMenu);
   elements.mobileBackdrop.addEventListener('click', closeMobileMenu);
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') closeMobileMenu();
+  });
+  window.addEventListener('resize', () => {
+    if (window.innerWidth > 920) closeMobileMenu();
+  });
 }
 
 function applyEvent(event) {
@@ -985,14 +993,23 @@ function scrollMessages() {
   });
 }
 
+function toggleMobileMenu() {
+  if (elements.sidebar.classList.contains('open')) closeMobileMenu();
+  else openMobileMenu();
+}
+
 function openMobileMenu() {
   elements.sidebar.classList.add('open');
   elements.mobileBackdrop.hidden = false;
+  document.body.classList.add('menu-open');
+  elements.menuButton.setAttribute('aria-expanded', 'true');
 }
 
 function closeMobileMenu() {
   elements.sidebar.classList.remove('open');
   elements.mobileBackdrop.hidden = true;
+  document.body.classList.remove('menu-open');
+  elements.menuButton.setAttribute('aria-expanded', 'false');
 }
 
 function renderMarkdown(value) {

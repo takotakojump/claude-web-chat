@@ -92,7 +92,6 @@ button:disabled {
 
 .app-shell {
   position: relative;
-  z-index: 1;
   display: grid;
   grid-template-columns: 318px minmax(0, 1fr);
   gap: 18px;
@@ -103,6 +102,8 @@ button:disabled {
 
 .sidebar,
 .chat-shell {
+  position: relative;
+  z-index: 1;
   border: 1px solid var(--line);
   background: var(--panel);
   box-shadow: var(--shadow);
@@ -123,6 +124,16 @@ button:disabled {
   align-items: center;
   gap: 14px;
   margin-bottom: 22px;
+}
+
+.brand-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.drawer-close {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .brand-mark {
@@ -935,7 +946,7 @@ button:disabled {
 .mobile-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 5;
+  z-index: 40;
   background: rgba(36, 24, 16, 0.32);
   backdrop-filter: blur(4px);
 }
@@ -959,10 +970,15 @@ button:disabled {
 
   .sidebar {
     position: fixed;
-    inset: 10px auto 10px 10px;
-    z-index: 10;
-    width: min(320px, calc(100vw - 28px));
-    transform: translateX(calc(-100% - 22px));
+    inset: max(10px, env(safe-area-inset-top)) auto max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+    z-index: 50;
+    width: min(360px, calc(100vw - 20px));
+    max-height: calc(100dvh - 20px);
+    padding: 18px;
+    border-radius: 26px;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    transform: translate3d(calc(-100% - 18px), 0, 0);
     transition: transform 220ms ease;
   }
 
@@ -984,6 +1000,17 @@ button:disabled {
     padding: calc(12px + env(safe-area-inset-top)) 14px 12px;
     background: rgba(250, 240, 226, 0.86);
     backdrop-filter: blur(20px);
+  }
+
+  .topbar > div:not(.top-actions) {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .topbar h2 {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .topbar h2 {
@@ -1098,6 +1125,12 @@ button:disabled {
 
   .composer-meta {
     display: none;
+  }
+}
+
+@media (max-width: 600px) {
+  .sidebar {
+    width: calc(100vw - 20px);
   }
 }
 
