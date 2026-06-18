@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Claude 本地聊天</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+
+    <div class="mobile-backdrop" id="mobileBackdrop" hidden></div>
+
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="会话侧边栏">
+        <div class="brand-lockup">
+          <div class="brand-mark">C</div>
+          <div>
+            <p class="eyebrow">Local Claude CLI</p>
+            <h1>Claude Web</h1>
+          </div>
+        </div>
+
+        <button class="new-chat" id="newChatButton" type="button">
+          <span>＋</span>
+          新对话
+        </button>
+
+        <div class="side-card">
+          <p class="side-label">连接状态</p>
+          <div class="status-line">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">未连接</span>
+          </div>
+          <dl class="meta-list">
+            <div>
+              <dt>模型</dt>
+              <dd id="modelText">自动</dd>
+            </div>
+            <div>
+              <dt>会话</dt>
+              <dd id="sessionText">-</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div class="side-card tips-card">
+          <p class="side-label">交互支持</p>
+          <p>工具授权、MCP 表单、选择按钮会以卡片形式出现在输入框上方。</p>
+        </div>
+
+        <div class="side-footer">
+          <button class="ghost-button" id="startButton" type="button">启动 Claude</button>
+          <button class="ghost-button danger" id="interruptButton" type="button">中断</button>
+        </div>
+      </aside>
+
+      <main class="chat-shell">
+        <header class="topbar">
+          <button class="icon-button mobile-menu" id="menuButton" type="button" aria-label="打开菜单">☰</button>
+          <div>
+            <p class="eyebrow">Warm local workspace</p>
+            <h2>和本地 Claude CLI 对话</h2>
+          </div>
+          <div class="top-actions">
+            <span class="pill" id="mobileStatus">idle</span>
+          </div>
+        </header>
+
+        <section class="messages" id="messages" aria-live="polite">
+          <div class="empty-state" id="emptyState">
+            <div class="empty-orb">✦</div>
+            <h2>今天想让 Claude 帮你做什么？</h2>
+            <p>这是一个本地网页壳，消息会流式发送给你电脑上的 Claude CLI。</p>
+            <div class="prompt-grid">
+              <button type="button" data-prompt="帮我检查当前项目结构，并给出下一步建议">检查项目结构</button>
+              <button type="button" data-prompt="写一个简洁的待办事项页面，要求支持手机布局">生成网页</button>
+              <button type="button" data-prompt="解释一下这个目录里最重要的文件分别做什么">解释目录</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="interaction-host" id="interactionHost" aria-live="assertive"></section>
+
+        <form class="composer" id="composer">
+          <div class="composer-inner">
+            <textarea id="promptInput" rows="1" placeholder="给 Claude 发消息...（Enter 发送，Shift+Enter 换行）"></textarea>
+            <button class="send-button" id="sendButton" type="submit" aria-label="发送">↑</button>
+          </div>
+          <div class="composer-meta">
+            <span id="cwdText">工作目录加载中...</span>
+            <span>本地运行，不经过这个网页服务器之外的第三方转发</span>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

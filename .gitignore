@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+*.log
+.env
+config.json
+logs/
+*.pid
+claude-web-chat.pid

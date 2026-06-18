@@ -1,0 +1,21 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 3652
+  },
+  "claude": {
+    "command": "",
+    "cwd": "..",
+    "apiKey": "",
+    "baseUrl": "",
+    "authToken": "",
+    "customHeaders": "",
+    "model": "",
+    "agent": "",
+    "appendSystemPrompt": "",
+    "extraArgs": [],
+    "skipPermissions": false,
+    "bare": false,
+    "env": {}
+  }
+}
