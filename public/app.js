@@ -524,6 +524,7 @@ function renderInteraction(data) {
   card.appendChild(head);
 
   if (data.kind === 'permission') renderPermissionBody(card, data);
+  else if (data.kind === 'ask_user_question') renderAskUserQuestionBody(card, data);
   else if (data.kind === 'elicitation') renderElicitationBody(card, data);
   else renderGenericBody(card, data);
 
@@ -582,6 +583,188 @@ function renderElicitationBody(card, data) {
     row.appendChild(button);
   }
   card.appendChild(row);
+}
+
+function renderAskUserQuestionBody(card, data) {
+  const questions = Array.isArray(data.questions) ? data.questions : [];
+  if (!questions.length) {
+    renderGenericBody(card, data);
+    return;
+  }
+
+  const form = document.createElement('div');
+  form.className = 'ask-form';
+  questions.forEach((question, questionIndex) => {
+    const section = document.createElement('section');
+    section.className = 'ask-question';
+    section.dataset.questionIndex = String(questionIndex);
+
+    const heading = document.createElement('div');
+    heading.className = 'ask-heading';
+    const chip = document.createElement('span');
+    chip.textContent = question.header || 'Choice';
+    const title = document.createElement('strong');
+    title.textContent = question.question || `Question ${questionIndex + 1}`;
+    heading.append(chip, title);
+    if (question.multiSelect) {
+      const hint = document.createElement('em');
+      hint.textContent = 'multi-select';
+      heading.appendChild(hint);
+    }
+    section.appendChild(heading);
+
+    const optionGrid = document.createElement('div');
+    optionGrid.className = 'ask-options';
+    const options = Array.isArray(question.options) ? question.options : [];
+    options.forEach((option, optionIndex) => {
+      optionGrid.appendChild(createAskOption(data.id, questionIndex, optionIndex, question, option));
+    });
+    optionGrid.appendChild(createAskOtherOption(data.id, questionIndex, question));
+    section.appendChild(optionGrid);
+
+    const notes = document.createElement('textarea');
+    notes.className = 'ask-notes';
+    notes.dataset.askNotes = 'true';
+    notes.placeholder = 'Optional notes for Claude...';
+    section.appendChild(notes);
+    form.appendChild(section);
+  });
+  card.appendChild(form);
+
+  const row = document.createElement('div');
+  row.className = 'choice-row';
+  const submit = choiceButton('answer', 'primary', findInteractionChoiceLabel(data, 'answer', 'Submit answer'));
+  submit.addEventListener('click', () => {
+    try {
+      const payload = collectAskUserQuestionPayload(card, questions);
+      respondFromCard(card, { id: data.id, action: 'answer', ...payload });
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+  const cancel = choiceButton('cancel', 'danger', findInteractionChoiceLabel(data, 'cancel', 'Cancel'));
+  cancel.addEventListener('click', () => respondFromCard(card, {
+    id: data.id,
+    action: 'cancel',
+    message: 'User cancelled the question.',
+  }));
+  row.append(submit, cancel);
+  card.appendChild(row);
+
+  const details = document.createElement('details');
+  details.className = 'details-toggle';
+  details.innerHTML = `
+    <summary>View raw request</summary>
+    <pre class="json-view"><code>${escapeHtml(JSON.stringify(data.request || {}, null, 2))}</code></pre>
+  `;
+  card.appendChild(details);
+}
+
+function createAskOption(interactionId, questionIndex, optionIndex, question, option) {
+  const id = `ask-${interactionId}-${questionIndex}-${optionIndex}`;
+  const label = document.createElement('label');
+  label.className = 'ask-option';
+  label.htmlFor = id;
+
+  const input = document.createElement('input');
+  input.type = question.multiSelect ? 'checkbox' : 'radio';
+  input.name = `ask-${interactionId}-${questionIndex}`;
+  input.id = id;
+  input.value = option.label || '';
+  input.dataset.askOption = 'true';
+  input.dataset.preview = option.preview || '';
+
+  const body = document.createElement('span');
+  body.className = 'ask-option-body';
+  const title = document.createElement('span');
+  title.className = 'ask-option-title';
+  title.textContent = option.label || `Option ${optionIndex + 1}`;
+  body.appendChild(title);
+  if (option.description) {
+    const description = document.createElement('span');
+    description.className = 'ask-option-description';
+    description.textContent = option.description;
+    body.appendChild(description);
+  }
+  if (option.preview) {
+    const preview = document.createElement('pre');
+    preview.className = 'option-preview';
+    preview.textContent = option.preview;
+    body.appendChild(preview);
+  }
+  label.append(input, body);
+  return label;
+}
+
+function createAskOtherOption(interactionId, questionIndex, question) {
+  const id = `ask-${interactionId}-${questionIndex}-other`;
+  const label = document.createElement('label');
+  label.className = 'ask-option ask-option-other';
+  label.htmlFor = id;
+
+  const input = document.createElement('input');
+  input.type = question.multiSelect ? 'checkbox' : 'radio';
+  input.name = `ask-${interactionId}-${questionIndex}`;
+  input.id = id;
+  input.value = '__other__';
+  input.dataset.askOption = 'true';
+  input.dataset.otherOption = 'true';
+
+  const body = document.createElement('span');
+  body.className = 'ask-option-body';
+  const title = document.createElement('span');
+  title.className = 'ask-option-title';
+  title.textContent = 'Other';
+  const otherInput = document.createElement('input');
+  otherInput.type = 'text';
+  otherInput.className = 'ask-other-input';
+  otherInput.dataset.askOtherText = 'true';
+  otherInput.placeholder = 'Type a custom answer';
+  otherInput.addEventListener('focus', () => { input.checked = true; });
+  body.append(title, otherInput);
+  label.append(input, body);
+  return label;
+}
+
+function collectAskUserQuestionPayload(card, questions) {
+  const answers = {};
+  const annotations = {};
+  questions.forEach((question, questionIndex) => {
+    const section = card.querySelector(`[data-question-index="${questionIndex}"]`);
+    if (!section) throw new Error('Question form is missing.');
+    const selected = question.multiSelect
+      ? Array.from(section.querySelectorAll('[data-ask-option]:checked'))
+      : [section.querySelector('[data-ask-option]:checked')].filter(Boolean);
+
+    const values = [];
+    let preview = '';
+    for (const input of selected) {
+      if (input.dataset.otherOption) {
+        const other = section.querySelector('[data-ask-other-text]');
+        const value = String((other && other.value) || '').trim();
+        if (value) values.push(value);
+      } else {
+        values.push(input.value);
+        if (!question.multiSelect && input.dataset.preview) preview = input.dataset.preview;
+      }
+    }
+    if (!values.length) throw new Error(`Please answer: ${question.question}`);
+
+    answers[question.question] = question.multiSelect ? values.join(', ') : values[0];
+    const notes = String(section.querySelector('[data-ask-notes]')?.value || '').trim();
+    const annotation = {};
+    if (preview) annotation.preview = preview;
+    if (notes) annotation.notes = notes;
+    if (Object.keys(annotation).length > 0) annotations[question.question] = annotation;
+  });
+  return { answers, annotations };
+}
+
+function findInteractionChoiceLabel(data, action, fallback) {
+  const choice = Array.isArray(data.choices)
+    ? data.choices.find(item => item.action === action)
+    : null;
+  return choice?.label || fallback;
 }
 
 function renderGenericBody(card, data) {
@@ -854,9 +1037,10 @@ function summarizeJson(value) {
 }
 
 function localizeTitle(data) {
-  if (data.kind === 'permission') return `允许 ${data.displayName || data.toolName || '工具'}？`;
-  if (data.kind === 'elicitation') return data.title || 'Claude 需要你补充信息';
-  return data.title || 'Claude 需要交互';
+  if (data.kind === 'permission') return `Allow ${data.displayName || data.toolName || 'tool'}?`;
+  if (data.kind === 'ask_user_question') return data.title || 'Claude asks a question';
+  if (data.kind === 'elicitation') return data.title || 'Claude needs input';
+  return data.title || 'Claude needs interaction';
 }
 
 function localizeAction(action) {
@@ -868,6 +1052,7 @@ function localizeAction(action) {
     accept: '提交',
     decline: '拒绝',
     cancel: '取消',
+    answer: 'Submit answer',
     send_success: '发送',
     send_error: '返回错误',
   })[action] || action;

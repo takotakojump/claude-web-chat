@@ -173,4 +173,6 @@ The app refuses to delete outside the resolved session directory.
 
 ## Interactions
 
-Claude CLI permission prompts and MCP elicitation requests are shown as cards above the input box. On mobile, use the menu button to open the sidebar; the chat and interaction cards adapt to narrow screens.
+Claude CLI permission prompts, MCP elicitation requests, and Claude Code's `AskUserQuestion` choice prompts are shown as cards above the input box. `AskUserQuestion` supports single choice, multi-select, optional custom "Other" answers, option previews, and notes.
+
+On mobile, use the menu button to open the sidebar; the chat and interaction cards adapt to narrow screens.

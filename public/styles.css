@@ -752,6 +752,126 @@ button:disabled {
   resize: vertical;
 }
 
+
+.ask-form {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.ask-question {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid rgba(201, 99, 50, 0.18);
+  border-radius: 18px;
+  background: rgba(255, 250, 242, 0.72);
+}
+
+.ask-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+
+.ask-heading span,
+.ask-heading em {
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: rgba(201, 99, 50, 0.12);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 900;
+}
+
+.ask-heading strong {
+  flex: 1 1 260px;
+  color: var(--ink);
+  font-size: 16px;
+  line-height: 1.35;
+}
+
+.ask-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+
+.ask-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.46);
+  cursor: pointer;
+  transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+
+.ask-option:has(input:checked) {
+  border-color: rgba(201, 99, 50, 0.62);
+  background: rgba(255, 238, 216, 0.76);
+  transform: translateY(-1px);
+}
+
+.ask-option input[type="radio"],
+.ask-option input[type="checkbox"] {
+  margin-top: 3px;
+  accent-color: var(--accent-strong);
+}
+
+.ask-option-body {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ask-option-title {
+  font-weight: 900;
+}
+
+.ask-option-description {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.42;
+}
+
+.option-preview {
+  max-height: 160px;
+  margin: 4px 0 0;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 12px;
+  color: #f9efe1;
+  background: #2d2119;
+  white-space: pre-wrap;
+}
+
+.ask-other-input,
+.ask-notes {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  outline: none;
+  background: rgba(255, 250, 242, 0.86);
+  color: var(--ink);
+}
+
+.ask-other-input {
+  min-height: 36px;
+  padding: 8px 10px;
+}
+
+.ask-notes {
+  min-height: 64px;
+  padding: 10px 12px;
+  resize: vertical;
+}
+
 .composer {
   padding: 0 clamp(18px, 4vw, 58px) calc(18px + env(safe-area-inset-bottom));
 }
@@ -942,6 +1062,14 @@ button:disabled {
   .choice-row {
     display: grid;
     grid-template-columns: 1fr 1fr;
+  }
+
+  .ask-options {
+    grid-template-columns: 1fr;
+  }
+
+  .ask-question {
+    padding: 12px;
   }
 
   .choice-button {

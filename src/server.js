@@ -25,6 +25,7 @@ const MAX_EVENT_LOG = 800;
 const MAX_STDERR_LOG = 200;
 const SESSION_COOKIE = 'cwc_session';
 const AUTH = buildAuthConfig();
+const ASK_USER_QUESTION_TOOL = 'AskUserQuestion';
 
 const clients = new Set();
 const pendingInteractions = new Map();
@@ -1112,11 +1113,13 @@ function handleControlRequest(message) {
   const request = message.request || {};
   if (!requestId) return;
 
-  const kind = request.subtype === 'can_use_tool'
-    ? 'permission'
-    : request.subtype === 'elicitation'
-      ? 'elicitation'
-      : 'generic';
+  const kind = isAskUserQuestionRequest(request)
+    ? 'ask_user_question'
+    : request.subtype === 'can_use_tool'
+      ? 'permission'
+      : request.subtype === 'elicitation'
+        ? 'elicitation'
+        : 'generic';
 
   const interaction = {
     id: requestId,
@@ -1128,6 +1131,10 @@ function handleControlRequest(message) {
 
   if (kind === 'permission') {
     emit('interaction_new', buildPermissionInteraction(requestId, request));
+    return;
+  }
+  if (kind === 'ask_user_question') {
+    emit('interaction_new', buildAskUserQuestionInteraction(requestId, request));
     return;
   }
   if (kind === 'elicitation') {
@@ -1174,6 +1181,56 @@ function buildPermissionInteraction(id, request) {
       { action: 'deny_interrupt', label: 'Deny and stop', tone: 'danger' },
     ],
   };
+}
+
+function isAskUserQuestionRequest(request) {
+  return request
+    && request.subtype === 'can_use_tool'
+    && request.tool_name === ASK_USER_QUESTION_TOOL
+    && request.input
+    && Array.isArray(request.input.questions);
+}
+
+function buildAskUserQuestionInteraction(id, request) {
+  const input = request.input && typeof request.input === 'object' ? request.input : {};
+  const questions = normalizeAskUserQuestions(input.questions);
+  return {
+    id,
+    kind: 'ask_user_question',
+    title: 'Claude asks a question',
+    description: request.description || request.message || 'Choose an option so Claude can continue.',
+    toolName: request.tool_name || ASK_USER_QUESTION_TOOL,
+    toolUseId: request.tool_use_id || null,
+    questions,
+    annotations: input.annotations && typeof input.annotations === 'object' ? input.annotations : {},
+    choices: [
+      { action: 'answer', label: 'Submit answer', tone: 'primary' },
+      { action: 'cancel', label: 'Cancel', tone: 'danger' },
+    ],
+    request: compactValue(request),
+  };
+}
+
+function normalizeAskUserQuestions(questions) {
+  if (!Array.isArray(questions)) return [];
+  return questions.map((question, index) => {
+    const item = question && typeof question === 'object' ? question : {};
+    return {
+      question: String(item.question || `Question ${index + 1}`),
+      header: String(item.header || 'Choice'),
+      multiSelect: Boolean(item.multiSelect),
+      options: Array.isArray(item.options)
+        ? item.options.map(option => {
+            const value = option && typeof option === 'object' ? option : {};
+            return {
+              label: String(value.label || ''),
+              description: String(value.description || ''),
+              ...(value.preview ? { preview: String(value.preview) } : {}),
+            };
+          }).filter(option => option.label)
+        : [],
+    };
+  }).filter(question => question.question && question.options.length >= 2);
 }
 
 function buildElicitationInteraction(id, request) {
@@ -1317,6 +1374,8 @@ function respondToInteraction(body) {
   let wrapper;
   if (interaction.kind === 'permission') {
     wrapper = buildPermissionResponse(id, action, interaction.request, body);
+  } else if (interaction.kind === 'ask_user_question') {
+    wrapper = buildAskUserQuestionResponse(id, action, interaction.request, body);
   } else if (interaction.kind === 'elicitation') {
     wrapper = buildElicitationResponse(id, action, body);
   } else {
@@ -1375,6 +1434,80 @@ function buildPermissionResponse(id, action, request, body) {
   };
 }
 
+function buildAskUserQuestionResponse(id, action, request, body) {
+  const toolUseID = request.tool_use_id;
+  const input = request.input && typeof request.input === 'object' ? request.input : {};
+  const questions = normalizeAskUserQuestions(input.questions);
+
+  let response;
+  if (action === 'answer') {
+    const answers = normalizeAskUserAnswers(body.answers, questions);
+    const annotations = normalizeAskUserAnnotations(body.annotations, questions);
+    const updatedInput = { ...input, answers };
+    if (Object.keys(annotations).length > 0) {
+      updatedInput.annotations = annotations;
+    } else {
+      delete updatedInput.annotations;
+    }
+    response = {
+      behavior: 'allow',
+      updatedInput,
+      updatedPermissions: [],
+      toolUseID,
+      decisionClassification: 'user_temporary',
+    };
+  } else {
+    response = {
+      behavior: 'deny',
+      message: body.message || 'User cancelled the question in Claude Web Chat.',
+      interrupt: false,
+      toolUseID,
+      decisionClassification: 'user_reject',
+    };
+  }
+
+  return {
+    type: 'control_response',
+    response: {
+      subtype: 'success',
+      request_id: id,
+      response,
+    },
+  };
+}
+
+function normalizeAskUserAnswers(rawAnswers, questions) {
+  if (!rawAnswers || typeof rawAnswers !== 'object' || Array.isArray(rawAnswers)) {
+    throw new Error('No answer was submitted.');
+  }
+  const answers = {};
+  for (const question of questions) {
+    const raw = rawAnswers[question.question];
+    const answer = Array.isArray(raw)
+      ? raw.map(value => String(value).trim()).filter(Boolean).join(', ')
+      : String(raw || '').trim();
+    if (!answer) throw new Error(`Missing answer for: ${question.question}`);
+    answers[question.question] = answer;
+  }
+  return answers;
+}
+
+function normalizeAskUserAnnotations(rawAnnotations, questions) {
+  if (!rawAnnotations || typeof rawAnnotations !== 'object' || Array.isArray(rawAnnotations)) {
+    return {};
+  }
+  const allowed = new Set(questions.map(question => question.question));
+  const annotations = {};
+  for (const [question, value] of Object.entries(rawAnnotations)) {
+    if (!allowed.has(question) || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const annotation = {};
+    if (value.preview) annotation.preview = String(value.preview);
+    if (value.notes) annotation.notes = String(value.notes);
+    if (Object.keys(annotation).length > 0) annotations[question] = annotation;
+  }
+  return annotations;
+}
+
 function buildElicitationResponse(id, action, body) {
   const normalized = ['accept', 'decline', 'cancel'].includes(action) ? action : 'cancel';
   const response = { action: normalized };
@@ -1421,6 +1554,7 @@ function labelForAction(action) {
     accept: 'Submitted',
     decline: 'Declined',
     cancel: 'Cancelled',
+    answer: 'Answered',
   })[action] || 'Responded';
 }
 
@@ -1696,6 +1830,9 @@ async function handleApi(req, res, url) {
         pendingInteractions: Array.from(pendingInteractions.values()).map(interaction => {
           if (interaction.kind === 'permission') {
             return buildPermissionInteraction(interaction.id, interaction.request);
+          }
+          if (interaction.kind === 'ask_user_question') {
+            return buildAskUserQuestionInteraction(interaction.id, interaction.request);
           }
           if (interaction.kind === 'elicitation') {
             return buildElicitationInteraction(interaction.id, interaction.request);
