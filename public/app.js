@@ -25,6 +25,7 @@ const elements = {
   mobileBackdrop: document.getElementById('mobileBackdrop'),
 };
 
+const INSTANCE_ID = getClientInstanceId();
 const messages = new Map();
 const interactions = new Map();
 let currentState = {};
@@ -35,7 +36,7 @@ wireUi();
 resizeTextarea();
 
 function connectEvents() {
-  eventSource = new EventSource('/api/events');
+  eventSource = new EventSource(`/api/events?instance=${encodeURIComponent(INSTANCE_ID)}`);
 
   eventSource.addEventListener('snapshot', event => {
     const snapshot = JSON.parse(event.data);
@@ -219,10 +220,27 @@ async function sendPrompt() {
   }
 }
 
+function getClientInstanceId() {
+  const key = 'claude-web-chat.instance-id';
+  let id = sessionStorage.getItem(key);
+  if (!id) {
+    const random = globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${Math.random()}`;
+    id = `web-${random.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64)}`;
+    sessionStorage.setItem(key, id);
+  }
+  return id;
+}
+
+function instanceHeaders(extra = {}) {
+  return { ...extra, 'x-cwc-instance': INSTANCE_ID };
+}
+
 async function postJson(url, payload) {
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: instanceHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify(payload),
   });
   const data = await response.json().catch(() => ({}));
@@ -238,7 +256,7 @@ async function postJson(url, payload) {
 
 
 async function getJson(url) {
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: instanceHeaders() });
   const data = await response.json().catch(() => ({}));
   if (response.status === 401 && data.authRequired) {
     location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;
@@ -251,7 +269,7 @@ async function getJson(url) {
 }
 
 async function deleteJson(url) {
-  const response = await fetch(url, { method: 'DELETE' });
+  const response = await fetch(url, { method: 'DELETE', headers: instanceHeaders() });
   const data = await response.json().catch(() => ({}));
   if (response.status === 401 && data.authRequired) {
     location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;

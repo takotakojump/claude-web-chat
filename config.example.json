@@ -1,7 +1,8 @@
 {
   "server": {
     "host": "127.0.0.1",
-    "port": 3652
+    "port": 3652,
+    "instanceTtlMinutes": 120
   },
   "auth": {
     "enabled": false,

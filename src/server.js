@@ -27,37 +27,81 @@ const SESSION_COOKIE = 'cwc_session';
 const AUTH = buildAuthConfig();
 const ASK_USER_QUESTION_TOOL = 'AskUserQuestion';
 
-const clients = new Set();
-const pendingInteractions = new Map();
-const stderrRing = [];
+const DEFAULT_INSTANCE_ID = 'default';
+const INSTANCE_HEADER = 'x-cwc-instance';
+const INSTANCE_TTL_MINUTES = Number(getConfig('server.instanceTtlMinutes')) || 120;
+const INSTANCE_TTL_MS = Math.max(5, INSTANCE_TTL_MINUTES) * 60 * 1000;
+
+const instances = new Map();
 const sessions = new Map();
 const loginAttempts = new Map();
 
-let eventLog = [];
-let claudeProcess = null;
-let stdoutBuffer = '';
-let stderrBuffer = '';
-let activeAssistantId = null;
-let activeResumeSessionId = null;
-let intentionalStop = false;
-let state = {
-  running: false,
-  busy: false,
-  status: 'idle',
-  pid: null,
-  sessionId: null,
-  loadedSessionId: null,
-  model: null,
-  cwd: CLAUDE_CWD,
-  command: resolveClaudeCommand(),
-  startedAt: null,
-  lastResult: null,
-  skipPermissions: getSkipPermissions(),
-  configPath: CONFIG_PATH,
-  hasApiKey: Boolean(getClaudeApiKey()),
-  baseUrl: getClaudeBaseUrl() || null,
-  authEnabled: AUTH.enabled,
-};
+function createInitialState() {
+  return {
+    running: false,
+    busy: false,
+    status: 'idle',
+    pid: null,
+    sessionId: null,
+    loadedSessionId: null,
+    model: null,
+    cwd: CLAUDE_CWD,
+    command: resolveClaudeCommand(),
+    startedAt: null,
+    lastResult: null,
+    skipPermissions: getSkipPermissions(),
+    configPath: CONFIG_PATH,
+    hasApiKey: Boolean(getClaudeApiKey()),
+    baseUrl: getClaudeBaseUrl() || null,
+    authEnabled: AUTH.enabled,
+    instanceId: DEFAULT_INSTANCE_ID,
+  };
+}
+
+function createInstance(id) {
+  const state = { ...createInitialState(), instanceId: id };
+  return {
+    id,
+    clients: new Set(),
+    pendingInteractions: new Map(),
+    stderrRing: [],
+    eventLog: [],
+    claudeProcess: null,
+    stdoutBuffer: '',
+    stderrBuffer: '',
+    activeAssistantId: null,
+    activeResumeSessionId: null,
+    intentionalStop: false,
+    state,
+    lastSeen: Date.now(),
+  };
+}
+
+function normalizeInstanceId(value) {
+  const id = String(value || '').trim();
+  if (!id) return DEFAULT_INSTANCE_ID;
+  return /^[a-zA-Z0-9_-]{8,80}$/.test(id) ? id : DEFAULT_INSTANCE_ID;
+}
+
+function getInstance(id = DEFAULT_INSTANCE_ID) {
+  const instanceId = normalizeInstanceId(id);
+  let instance = instances.get(instanceId);
+  if (!instance) {
+    instance = createInstance(instanceId);
+    instances.set(instanceId, instance);
+  }
+  instance.lastSeen = Date.now();
+  return instance;
+}
+
+function getRequestInstance(req, url, body) {
+  return getInstance(
+    (body && body.instanceId)
+    || (url && url.searchParams.get('instance'))
+    || req.headers[INSTANCE_HEADER]
+    || DEFAULT_INSTANCE_ID,
+  );
+}
 
 function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) return {};
@@ -651,20 +695,20 @@ function extractUserHistoryText(content) {
   return textParts.join('\n').trim();
 }
 
-function terminateClaudeProcess(reason) {
-  if (!claudeProcess) return;
-  intentionalStop = true;
-  const child = claudeProcess;
-  claudeProcess = null;
-  activeAssistantId = null;
-  for (const interaction of pendingInteractions.values()) {
-    emit('interaction_resolved', {
+function terminateClaudeProcess(ctx, reason) {
+  if (!ctx.claudeProcess) return;
+  ctx.intentionalStop = true;
+  const child = ctx.claudeProcess;
+  ctx.claudeProcess = null;
+  ctx.activeAssistantId = null;
+  for (const interaction of ctx.pendingInteractions.values()) {
+    emit(ctx, 'interaction_resolved', {
       id: interaction.id,
       status: 'cancelled',
       label: reason || 'Claude CLI stopped',
     });
   }
-  pendingInteractions.clear();
+  ctx.pendingInteractions.clear();
   if (process.platform === 'win32' && child.pid) {
     spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
       windowsHide: true,
@@ -673,29 +717,29 @@ function terminateClaudeProcess(reason) {
   } else {
     child.kill('SIGTERM');
   }
-  updateState({ running: false, busy: false, status: 'idle', pid: null, startedAt: null });
+  updateState(ctx, { running: false, busy: false, status: 'idle', pid: null, startedAt: null });
 }
 
-function emitHistoryMessages(history) {
-  eventLog = [];
-  activeAssistantId = null;
-  emit('reset', {});
+function emitHistoryMessages(ctx, history) {
+  ctx.eventLog = [];
+  ctx.activeAssistantId = null;
+  emit(ctx, 'reset', {});
   for (const message of history.messages) {
-    emit('message_new', message);
+    emit(ctx, 'message_new', message);
   }
-  emit('system', {
+  emit(ctx, 'system', {
     level: 'info',
     text: `Loaded Claude session ${history.id}`,
     detail: `${history.messages.length} messages`,
   });
 }
 
-function loadClaudeSession(sessionId) {
+function loadClaudeSession(ctx, sessionId) {
   const history = parseClaudeSession(sessionId);
-  terminateClaudeProcess('Switching Claude session');
-  activeResumeSessionId = history.id;
-  emitHistoryMessages(history);
-  updateState({
+  terminateClaudeProcess(ctx, 'Switching Claude session');
+  ctx.activeResumeSessionId = history.id;
+  emitHistoryMessages(ctx, history);
+  updateState(ctx, {
     sessionId: history.id,
     loadedSessionId: history.id,
     busy: false,
@@ -705,7 +749,7 @@ function loadClaudeSession(sessionId) {
   return history;
 }
 
-function buildClaudeArgs() {
+function buildClaudeArgs(ctx) {
   const args = [
     '--print',
     '--input-format',
@@ -728,7 +772,7 @@ function buildClaudeArgs() {
     process.env.CLAUDE_SYSTEM_PROMPT,
     getConfig('claude.appendSystemPrompt'),
   );
-  if (activeResumeSessionId) args.push('--resume', activeResumeSessionId);
+  if (ctx.activeResumeSessionId) args.push('--resume', ctx.activeResumeSessionId);
   if (model) args.push('--model', String(model));
   if (agent) args.push('--agent', String(agent));
   if (systemPrompt) args.push('--append-system-prompt', String(systemPrompt));
@@ -742,7 +786,7 @@ function sendSse(res, eventName, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
-function emit(type, payload = {}, options = {}) {
+function emit(ctx, type, payload = {}, options = {}) {
   const event = {
     id: randomUUID(),
     type,
@@ -751,47 +795,47 @@ function emit(type, payload = {}, options = {}) {
   };
 
   if (options.log !== false) {
-    eventLog.push(event);
-    if (eventLog.length > MAX_EVENT_LOG) {
-      eventLog = eventLog.slice(eventLog.length - MAX_EVENT_LOG);
+    ctx.eventLog.push(event);
+    if (ctx.eventLog.length > MAX_EVENT_LOG) {
+      ctx.eventLog = ctx.eventLog.slice(ctx.eventLog.length - MAX_EVENT_LOG);
     }
   }
 
-  for (const client of clients) {
+  for (const client of ctx.clients) {
     sendSse(client, 'event', event);
   }
   return event;
 }
 
-function updateState(patch) {
-  state = { ...state, ...patch };
-  emit('state', state, { log: false });
+function updateState(ctx, patch) {
+  ctx.state = { ...ctx.state, ...patch };
+  emit(ctx, 'state', ctx.state, { log: false });
 }
 
-function startClaude() {
-  if (claudeProcess && !claudeProcess.killed) return claudeProcess;
+function startClaude(ctx) {
+  if (ctx.claudeProcess && !ctx.claudeProcess.killed) return ctx.claudeProcess;
 
   const command = resolveClaudeCommand();
-  const args = buildClaudeArgs();
-  intentionalStop = false;
-  stdoutBuffer = '';
-  stderrBuffer = '';
-  state.command = command;
-  state.cwd = CLAUDE_CWD;
-  state.hasApiKey = Boolean(getClaudeApiKey());
-  state.baseUrl = getClaudeBaseUrl() || null;
-  state.skipPermissions = getSkipPermissions();
-  state.loadedSessionId = activeResumeSessionId;
+  const args = buildClaudeArgs(ctx);
+  ctx.intentionalStop = false;
+  ctx.stdoutBuffer = '';
+  ctx.stderrBuffer = '';
+  ctx.state.command = command;
+  ctx.state.cwd = CLAUDE_CWD;
+  ctx.state.hasApiKey = Boolean(getClaudeApiKey());
+  ctx.state.baseUrl = getClaudeBaseUrl() || null;
+  ctx.state.skipPermissions = getSkipPermissions();
+  ctx.state.loadedSessionId = ctx.activeResumeSessionId;
 
-  updateState({ status: 'starting', running: false, pid: null, startedAt: null });
-  emit('system', {
+  updateState(ctx, { status: 'starting', running: false, pid: null, startedAt: null });
+  emit(ctx, 'system', {
     level: 'info',
     text: 'Starting Claude CLI',
     detail: `${command} ${redactArgs(args).join(' ')}`,
   });
 
   try {
-    claudeProcess = spawn(command, args, {
+    ctx.claudeProcess = spawn(command, args, {
       cwd: CLAUDE_CWD,
       env: buildClaudeEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -799,43 +843,43 @@ function startClaude() {
       shell: process.platform === 'win32',
     });
   } catch (error) {
-    claudeProcess = null;
-    updateState({ running: false, busy: false, status: 'error' });
-    emit('error', { text: `Unable to start Claude CLI: ${error.message}` });
+    ctx.claudeProcess = null;
+    updateState(ctx, { running: false, busy: false, status: 'error' });
+    emit(ctx, 'error', { text: `Unable to start Claude CLI: ${error.message}` });
     return null;
   }
 
-  const child = claudeProcess;
+  const child = ctx.claudeProcess;
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
 
-  child.stdout.on('data', chunk => feedStdout(chunk));
-  child.stderr.on('data', chunk => feedStderr(chunk));
+  child.stdout.on('data', chunk => feedStdout(ctx, chunk));
+  child.stderr.on('data', chunk => feedStderr(ctx, chunk));
 
   child.on('error', error => {
-    if (child !== claudeProcess) return;
-    emit('error', { text: `Claude CLI process error: ${error.message}` });
-    updateState({ running: false, busy: false, status: 'error', pid: null });
+    if (child !== ctx.claudeProcess) return;
+    emit(ctx, 'error', { text: `Claude CLI process error: ${error.message}` });
+    updateState(ctx, { running: false, busy: false, status: 'error', pid: null });
   });
 
   child.on('exit', (code, signal) => {
-    if (child !== claudeProcess) return;
-    const clean = intentionalStop || code === 0;
-    emit('system', {
+    if (child !== ctx.claudeProcess) return;
+    const clean = ctx.intentionalStop || code === 0;
+    emit(ctx, 'system', {
       level: clean ? 'info' : 'error',
       text: `Claude CLI exited (${signal || (code ?? 'unknown')})`,
     });
-    for (const interaction of pendingInteractions.values()) {
-      emit('interaction_resolved', {
+    for (const interaction of ctx.pendingInteractions.values()) {
+      emit(ctx, 'interaction_resolved', {
         id: interaction.id,
         status: 'cancelled',
         label: 'Claude CLI stopped',
       });
     }
-    pendingInteractions.clear();
-    claudeProcess = null;
-    activeAssistantId = null;
-    updateState({
+    ctx.pendingInteractions.clear();
+    ctx.claudeProcess = null;
+    ctx.activeAssistantId = null;
+    updateState(ctx, {
       running: false,
       busy: false,
       status: clean ? 'idle' : 'exited',
@@ -844,7 +888,7 @@ function startClaude() {
     });
   });
 
-  updateState({
+  updateState(ctx, {
     running: true,
     status: 'ready',
     pid: child.pid || null,
@@ -853,10 +897,10 @@ function startClaude() {
   return child;
 }
 
-function stopClaude() {
-  if (!claudeProcess) return;
-  intentionalStop = true;
-  const child = claudeProcess;
+function stopClaude(ctx) {
+  if (!ctx.claudeProcess) return;
+  ctx.intentionalStop = true;
+  const child = ctx.claudeProcess;
   if (process.platform === 'win32' && child.pid) {
     spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
       windowsHide: true,
@@ -867,118 +911,133 @@ function stopClaude() {
   }
 }
 
-function resetConversation() {
-  eventLog = [];
-  pendingInteractions.clear();
-  stderrRing.length = 0;
-  activeAssistantId = null;
-  activeResumeSessionId = null;
-  state = {
-    ...state,
+function stopAllClaudeInstances() {
+  for (const ctx of instances.values()) stopClaude(ctx);
+}
+
+function cleanupIdleInstances() {
+  const now = Date.now();
+  for (const [id, ctx] of instances.entries()) {
+    if (ctx.clients.size > 0) continue;
+    if (now - ctx.lastSeen < INSTANCE_TTL_MS) continue;
+    terminateClaudeProcess(ctx, 'Chat instance expired');
+    instances.delete(id);
+  }
+}
+
+
+function resetConversation(ctx) {
+  ctx.eventLog = [];
+  ctx.pendingInteractions.clear();
+  ctx.stderrRing.length = 0;
+  ctx.activeAssistantId = null;
+  ctx.activeResumeSessionId = null;
+  ctx.state = {
+    ...ctx.state,
     busy: false,
-    status: claudeProcess ? 'ready' : 'idle',
+    status: ctx.claudeProcess ? 'ready' : 'idle',
     lastResult: null,
     sessionId: null,
     loadedSessionId: null,
   };
-  emit('reset', {});
-  updateState(state);
+  emit(ctx, 'reset', {});
+  updateState(ctx, ctx.state);
 }
 
-function feedStdout(chunk) {
-  stdoutBuffer += chunk;
+function feedStdout(ctx, chunk) {
+  ctx.stdoutBuffer += chunk;
   let newlineIndex;
-  while ((newlineIndex = stdoutBuffer.indexOf('\n')) >= 0) {
-    const line = stdoutBuffer.slice(0, newlineIndex).trimEnd();
-    stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-    if (line) handleStdoutLine(line);
+  while ((newlineIndex = ctx.stdoutBuffer.indexOf('\n')) >= 0) {
+    const line = ctx.stdoutBuffer.slice(0, newlineIndex).trimEnd();
+    ctx.stdoutBuffer = ctx.stdoutBuffer.slice(newlineIndex + 1);
+    if (line) handleStdoutLine(ctx, line);
   }
 }
 
-function feedStderr(chunk) {
-  stderrBuffer += chunk;
+function feedStderr(ctx, chunk) {
+  ctx.stderrBuffer += chunk;
   let newlineIndex;
-  while ((newlineIndex = stderrBuffer.indexOf('\n')) >= 0) {
-    const line = stderrBuffer.slice(0, newlineIndex).trimEnd();
-    stderrBuffer = stderrBuffer.slice(newlineIndex + 1);
-    if (line) logStderr(line);
+  while ((newlineIndex = ctx.stderrBuffer.indexOf('\n')) >= 0) {
+    const line = ctx.stderrBuffer.slice(0, newlineIndex).trimEnd();
+    ctx.stderrBuffer = ctx.stderrBuffer.slice(newlineIndex + 1);
+    if (line) logStderr(ctx, line);
   }
 }
 
-function logStderr(line) {
-  stderrRing.push(line);
-  if (stderrRing.length > MAX_STDERR_LOG) stderrRing.shift();
-  emit('stderr', { text: line }, { log: false });
+function logStderr(ctx, line) {
+  ctx.stderrRing.push(line);
+  if (ctx.stderrRing.length > MAX_STDERR_LOG) ctx.stderrRing.shift();
+  emit(ctx, 'stderr', { text: line }, { log: false });
 }
 
-function handleStdoutLine(line) {
+function handleStdoutLine(ctx, line) {
   let message;
   try {
     message = JSON.parse(line);
   } catch (error) {
-    emit('cli_text', { stream: 'stdout', text: line });
+    emit(ctx, 'cli_text', { stream: 'stdout', text: line });
     return;
   }
-  handleClaudeMessage(message);
+  handleClaudeMessage(ctx, message);
 }
 
-function handleClaudeMessage(message) {
+function handleClaudeMessage(ctx, message) {
   switch (message.type) {
     case 'system':
-      handleSystemMessage(message);
+      handleSystemMessage(ctx, message);
       break;
     case 'assistant':
-      handleAssistantMessage(message);
+      handleAssistantMessage(ctx, message);
       break;
     case 'stream_event':
-      handleStreamEvent(message);
+      handleStreamEvent(ctx, message);
       break;
     case 'streamlined_text':
-      handleStreamlinedText(message);
+      handleStreamlinedText(ctx, message);
       break;
     case 'streamlined_tool_use_summary':
     case 'tool_use_summary':
-      emit('tool_summary', { text: message.tool_summary || message.summary || '' });
+      emit(ctx, 'tool_summary', { text: message.tool_summary || message.summary || '' });
       break;
     case 'result':
-      handleResultMessage(message);
+      handleResultMessage(ctx, message);
       break;
     case 'control_request':
-      handleControlRequest(message);
+      handleControlRequest(ctx, message);
       break;
     case 'control_cancel_request':
-      handleControlCancel(message);
+      handleControlCancel(ctx, message);
       break;
     case 'control_response':
-      emit('control_response', { response: message.response || null }, { log: false });
+      emit(ctx, 'control_response', { response: message.response || null }, { log: false });
       break;
     case 'user':
-      emit('user_ack', { uuid: message.uuid || null, sessionId: message.session_id || null }, { log: false });
+      emit(ctx, 'user_ack', { uuid: message.uuid || null, sessionId: message.session_id || null }, { log: false });
       break;
     case 'rate_limit_event':
-      emit('rate_limit', { info: message.rate_limit_info || null });
+      emit(ctx, 'rate_limit', { info: message.rate_limit_info || null });
       break;
     case 'auth_status':
-      emit('auth_status', { status: message.status || message.auth_status || message });
+      emit(ctx, 'auth_status', { status: message.status || message.auth_status || message });
       break;
     case 'prompt_suggestion':
-      emit('prompt_suggestion', { suggestion: message.suggestion || message.prompt || message });
+      emit(ctx, 'prompt_suggestion', { suggestion: message.suggestion || message.prompt || message });
       break;
     default:
-      emit('raw_message', { message: compactValue(message) }, { log: false });
+      emit(ctx, 'raw_message', { message: compactValue(message) }, { log: false });
       break;
   }
 }
 
-function handleSystemMessage(message) {
+function handleSystemMessage(ctx, message) {
   if (message.subtype === 'init') {
-    updateState({
-      sessionId: message.session_id || state.sessionId,
-      model: message.model || state.model,
+    updateState(ctx, {
+      sessionId: message.session_id || ctx.state.sessionId,
+      model: message.model || ctx.state.model,
       status: 'ready',
       running: true,
     });
-    emit('system', {
+    emit(ctx, 'system', {
       level: 'info',
       text: 'Claude session initialized',
       detail: [message.model, message.cwd || CLAUDE_CWD].filter(Boolean).join(' - '),
@@ -988,12 +1047,12 @@ function handleSystemMessage(message) {
 
   if (message.subtype === 'status') {
     const text = message.message || message.status || message.title || 'Status update';
-    emit('status_text', { text, raw: compactValue(message) }, { log: false });
+    emit(ctx, 'status_text', { text, raw: compactValue(message) }, { log: false });
     return;
   }
 
   if (message.subtype === 'task_notification') {
-    emit('system', {
+    emit(ctx, 'system', {
       level: 'info',
       text: message.message || message.notification || 'Task notification',
       detail: message.title || '',
@@ -1001,7 +1060,7 @@ function handleSystemMessage(message) {
     return;
   }
 
-  emit('system', {
+  emit(ctx, 'system', {
     level: 'info',
     text: message.subtype ? `System: ${message.subtype}` : 'System message',
     detail: message.message || '',
@@ -1009,51 +1068,51 @@ function handleSystemMessage(message) {
   });
 }
 
-function handleAssistantMessage(message) {
-  const id = getAssistantId(message);
+function handleAssistantMessage(ctx, message) {
+  const id = getAssistantId(ctx, message);
   const extracted = extractContentBlocks(message.message && message.message.content);
-  ensureAssistantMessage(id, { status: 'done' });
-  emit('message_replace', {
+  ensureAssistantMessage(ctx, id, { status: 'done' });
+  emit(ctx, 'message_replace', {
     id,
     text: extracted.text,
     blocks: extracted.blocks,
     status: 'done',
   });
-  activeAssistantId = null;
+  ctx.activeAssistantId = null;
 }
 
-function handleStreamlinedText(message) {
-  const id = message.uuid || activeAssistantId || randomUUID();
-  ensureAssistantMessage(id, { status: 'streaming' });
-  emit('message_delta', { id, text: message.text || '' });
-  activeAssistantId = id;
+function handleStreamlinedText(ctx, message) {
+  const id = message.uuid || ctx.activeAssistantId || randomUUID();
+  ensureAssistantMessage(ctx, id, { status: 'streaming' });
+  emit(ctx, 'message_delta', { id, text: message.text || '' });
+  ctx.activeAssistantId = id;
 }
 
-function handleStreamEvent(message) {
+function handleStreamEvent(ctx, message) {
   const event = message.event || {};
-  const id = message.uuid || activeAssistantId || randomUUID();
+  const id = message.uuid || ctx.activeAssistantId || randomUUID();
 
   if (event.type === 'message_start') {
-    activeAssistantId = id;
-    ensureAssistantMessage(id, { status: 'streaming' });
+    ctx.activeAssistantId = id;
+    ensureAssistantMessage(ctx, id, { status: 'streaming' });
     return;
   }
 
-  if (!activeAssistantId) activeAssistantId = id;
-  ensureAssistantMessage(activeAssistantId, { status: 'streaming' });
+  if (!ctx.activeAssistantId) ctx.activeAssistantId = id;
+  ensureAssistantMessage(ctx, ctx.activeAssistantId, { status: 'streaming' });
 
   if (event.type === 'content_block_start') {
     const block = event.content_block || {};
     if (block.type === 'text' && block.text) {
-      emit('message_delta', { id: activeAssistantId, text: block.text });
+      emit(ctx, 'message_delta', { id: ctx.activeAssistantId, text: block.text });
     } else if (block.type === 'thinking') {
-      emit('thinking_delta', {
-        id: activeAssistantId,
+      emit(ctx, 'thinking_delta', {
+        id: ctx.activeAssistantId,
         text: block.thinking || block.text || '',
       });
     } else if (block.type === 'tool_use') {
-      emit('tool_use', {
-        id: activeAssistantId,
+      emit(ctx, 'tool_use', {
+        id: ctx.activeAssistantId,
         toolUseId: block.id || null,
         name: block.name || 'tool',
         input: block.input || {},
@@ -1066,12 +1125,12 @@ function handleStreamEvent(message) {
   if (event.type === 'content_block_delta') {
     const delta = event.delta || {};
     if (delta.type === 'text_delta' && delta.text) {
-      emit('message_delta', { id: activeAssistantId, text: delta.text });
+      emit(ctx, 'message_delta', { id: ctx.activeAssistantId, text: delta.text });
     } else if (delta.type === 'thinking_delta' && delta.thinking) {
-      emit('thinking_delta', { id: activeAssistantId, text: delta.thinking });
+      emit(ctx, 'thinking_delta', { id: ctx.activeAssistantId, text: delta.thinking });
     } else if (delta.type === 'input_json_delta' && delta.partial_json) {
-      emit('tool_input_delta', {
-        id: activeAssistantId,
+      emit(ctx, 'tool_input_delta', {
+        id: ctx.activeAssistantId,
         index: event.index,
         partialJson: delta.partial_json,
       });
@@ -1080,16 +1139,16 @@ function handleStreamEvent(message) {
   }
 
   if (event.type === 'message_stop') {
-    emit('message_patch', { id: activeAssistantId, status: 'finishing' });
+    emit(ctx, 'message_patch', { id: ctx.activeAssistantId, status: 'finishing' });
     return;
   }
 
   if (event.type === 'content_block_stop') {
-    emit('stream_marker', { id: activeAssistantId, marker: 'content_block_stop' }, { log: false });
+    emit(ctx, 'stream_marker', { id: ctx.activeAssistantId, marker: 'content_block_stop' }, { log: false });
   }
 }
 
-function handleResultMessage(message) {
+function handleResultMessage(ctx, message) {
   const result = {
     subtype: message.subtype || 'success',
     durationMs: message.duration_ms || message.durationMs || null,
@@ -1097,18 +1156,18 @@ function handleResultMessage(message) {
     costUsd: message.total_cost_usd || message.cost_usd || null,
     isError: message.is_error || message.subtype === 'error_during_execution',
     numTurns: message.num_turns || null,
-    sessionId: message.session_id || state.sessionId,
+    sessionId: message.session_id || ctx.state.sessionId,
   };
-  updateState({
+  updateState(ctx, {
     busy: false,
     status: result.isError ? 'error' : 'ready',
     lastResult: result,
-    sessionId: result.sessionId || state.sessionId,
+    sessionId: result.sessionId || ctx.state.sessionId,
   });
-  emit('result', result);
+  emit(ctx, 'result', result);
 }
 
-function handleControlRequest(message) {
+function handleControlRequest(ctx, message) {
   const requestId = message.request_id;
   const request = message.request || {};
   if (!requestId) return;
@@ -1127,21 +1186,21 @@ function handleControlRequest(message) {
     request,
     createdAt: new Date().toISOString(),
   };
-  pendingInteractions.set(requestId, interaction);
+  ctx.pendingInteractions.set(requestId, interaction);
 
   if (kind === 'permission') {
-    emit('interaction_new', buildPermissionInteraction(requestId, request));
+    emit(ctx, 'interaction_new', buildPermissionInteraction(requestId, request));
     return;
   }
   if (kind === 'ask_user_question') {
-    emit('interaction_new', buildAskUserQuestionInteraction(requestId, request));
+    emit(ctx, 'interaction_new', buildAskUserQuestionInteraction(requestId, request));
     return;
   }
   if (kind === 'elicitation') {
-    emit('interaction_new', buildElicitationInteraction(requestId, request));
+    emit(ctx, 'interaction_new', buildElicitationInteraction(requestId, request));
     return;
   }
-  emit('interaction_new', {
+  emit(ctx, 'interaction_new', {
     id: requestId,
     kind: 'generic',
     title: `Claude requests ${request.subtype || 'input'}`,
@@ -1150,11 +1209,11 @@ function handleControlRequest(message) {
   });
 }
 
-function handleControlCancel(message) {
+function handleControlCancel(ctx, message) {
   const id = message.request_id;
   if (!id) return;
-  pendingInteractions.delete(id);
-  emit('interaction_resolved', { id, status: 'cancelled', label: 'Cancelled' });
+  ctx.pendingInteractions.delete(id);
+  emit(ctx, 'interaction_resolved', { id, status: 'cancelled', label: 'Cancelled' });
 }
 
 function buildPermissionInteraction(id, request) {
@@ -1268,13 +1327,13 @@ function formatShort(value) {
   return text.length > 160 ? `${text.slice(0, 160)}...` : text;
 }
 
-function getAssistantId(message) {
-  return message.uuid || (message.message && message.message.id) || activeAssistantId || randomUUID();
+function getAssistantId(ctx, message) {
+  return message.uuid || (message.message && message.message.id) || ctx.activeAssistantId || randomUUID();
 }
 
-function ensureAssistantMessage(id, patch = {}) {
-  if (activeAssistantId !== id) activeAssistantId = id;
-  emit('message_new', {
+function ensureAssistantMessage(ctx, id, patch = {}) {
+  if (ctx.activeAssistantId !== id) ctx.activeAssistantId = id;
+  emit(ctx, 'message_new', {
     id,
     role: 'assistant',
     text: '',
@@ -1333,20 +1392,20 @@ function compactValue(value) {
   }
 }
 
-function writeToClaude(payload) {
-  const child = startClaude();
+function writeToClaude(ctx, payload) {
+  const child = startClaude(ctx);
   if (!child || !child.stdin || child.stdin.destroyed) {
     throw new Error('Claude CLI is not available');
   }
   child.stdin.write(`${JSON.stringify(payload)}\n`);
 }
 
-function sendUserMessage(text) {
+function sendUserMessage(ctx, text) {
   const trimmed = String(text || '').trim();
   if (!trimmed) throw new Error('Message is empty');
 
   const id = randomUUID();
-  emit('message_new', {
+  emit(ctx, 'message_new', {
     id,
     role: 'user',
     text: trimmed,
@@ -1354,21 +1413,21 @@ function sendUserMessage(text) {
     status: 'sent',
   });
 
-  updateState({ busy: true, status: 'thinking' });
-  writeToClaude({
+  updateState(ctx, { busy: true, status: 'thinking' });
+  writeToClaude(ctx, {
     type: 'user',
     uuid: id,
-    session_id: state.sessionId || '',
+    session_id: ctx.state.sessionId || '',
     message: { role: 'user', content: trimmed },
     parent_tool_use_id: null,
   });
   return id;
 }
 
-function respondToInteraction(body) {
+function respondToInteraction(ctx, body) {
   const id = String(body.id || '');
   const action = String(body.action || '');
-  const interaction = pendingInteractions.get(id);
+  const interaction = ctx.pendingInteractions.get(id);
   if (!interaction) throw new Error('Interaction is no longer pending');
 
   let wrapper;
@@ -1382,9 +1441,9 @@ function respondToInteraction(body) {
     wrapper = buildGenericResponse(id, body);
   }
 
-  writeToClaude(wrapper);
-  pendingInteractions.delete(id);
-  emit('interaction_resolved', {
+  writeToClaude(ctx, wrapper);
+  ctx.pendingInteractions.delete(id);
+  emit(ctx, 'interaction_resolved', {
     id,
     status: 'resolved',
     label: labelForAction(action),
@@ -1558,14 +1617,14 @@ function labelForAction(action) {
   })[action] || 'Responded';
 }
 
-function sendInterrupt() {
-  writeToClaude({
+function sendInterrupt(ctx) {
+  writeToClaude(ctx, {
     type: 'control_request',
     request_id: randomUUID(),
     request: { subtype: 'interrupt' },
   });
-  updateState({ busy: false, status: 'interrupted' });
-  emit('system', { level: 'warn', text: 'Interrupt sent to Claude CLI' });
+  updateState(ctx, { busy: false, status: 'interrupted' });
+  emit(ctx, 'system', { level: 'warn', text: 'Interrupt sent to Claude CLI' });
 }
 
 async function readJsonBody(req) {
@@ -1774,10 +1833,11 @@ async function handleApi(req, res, url) {
     }
 
     if (url.pathname === '/api/sessions/clear' && req.method === 'POST') {
-      terminateClaudeProcess('Clearing Claude sessions');
-      activeResumeSessionId = null;
+      const ctx = getRequestInstance(req, url);
+      terminateClaudeProcess(ctx, 'Clearing Claude sessions');
+      ctx.activeResumeSessionId = null;
       const result = clearClaudeSessions();
-      resetConversation();
+      resetConversation(ctx);
       jsonResponse(res, 200, { ok: true, ...result });
       return true;
     }
@@ -1792,16 +1852,18 @@ async function handleApi(req, res, url) {
         return true;
       }
       if (req.method === 'POST' && action === 'load') {
-        const history = loadClaudeSession(sessionId);
+        const ctx = getRequestInstance(req, url);
+        const history = loadClaudeSession(ctx, sessionId);
         jsonResponse(res, 200, { ok: true, session: history });
         return true;
       }
       if (req.method === 'DELETE' && !action) {
+        const ctx = getRequestInstance(req, url);
         const id = safeSessionId(sessionId);
-        if (id === activeResumeSessionId || id === state.sessionId) {
-          terminateClaudeProcess('Deleting active Claude session');
-          activeResumeSessionId = null;
-          resetConversation();
+        if (id === ctx.activeResumeSessionId || id === ctx.state.sessionId) {
+          terminateClaudeProcess(ctx, 'Deleting active Claude session');
+          ctx.activeResumeSessionId = null;
+          resetConversation(ctx);
         }
         const result = deleteClaudeSession(id);
         jsonResponse(res, 200, { ok: true, ...result });
@@ -1812,22 +1874,25 @@ async function handleApi(req, res, url) {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/status') {
-      jsonResponse(res, 200, { ok: true, state, pending: Array.from(pendingInteractions.keys()) });
+      const ctx = getRequestInstance(req, url);
+      jsonResponse(res, 200, { ok: true, state: ctx.state, pending: Array.from(ctx.pendingInteractions.keys()) });
       return true;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/events') {
+      const ctx = getRequestInstance(req, url);
       res.writeHead(200, {
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-store, no-transform',
         connection: 'keep-alive',
         'x-accel-buffering': 'no',
       });
-      clients.add(res);
+      ctx.clients.add(res);
       sendSse(res, 'snapshot', {
-        state,
-        events: eventLog,
-        pendingInteractions: Array.from(pendingInteractions.values()).map(interaction => {
+        state: ctx.state,
+        instanceId: ctx.id,
+        events: ctx.eventLog,
+        pendingInteractions: Array.from(ctx.pendingInteractions.values()).map(interaction => {
           if (interaction.kind === 'permission') {
             return buildPermissionInteraction(interaction.id, interaction.request);
           }
@@ -1848,46 +1913,52 @@ async function handleApi(req, res, url) {
       const heartbeat = setInterval(() => sendSse(res, 'ping', { at: Date.now() }), 15000);
       req.on('close', () => {
         clearInterval(heartbeat);
-        clients.delete(res);
+        ctx.clients.delete(res);
       });
       return true;
     }
 
     if (req.method === 'POST' && url.pathname === '/api/send') {
       const body = await readJsonBody(req);
-      const id = sendUserMessage(body.text);
+      const ctx = getRequestInstance(req, url, body);
+      const id = sendUserMessage(ctx, body.text);
       jsonResponse(res, 200, { ok: true, id });
       return true;
     }
 
     if (req.method === 'POST' && url.pathname === '/api/respond') {
       const body = await readJsonBody(req);
-      respondToInteraction(body);
+      const ctx = getRequestInstance(req, url, body);
+      respondToInteraction(ctx, body);
       jsonResponse(res, 200, { ok: true });
       return true;
     }
 
     if (req.method === 'POST' && url.pathname === '/api/interrupt') {
-      sendInterrupt();
+      const ctx = getRequestInstance(req, url);
+      sendInterrupt(ctx);
       jsonResponse(res, 200, { ok: true });
       return true;
     }
 
     if (req.method === 'POST' && url.pathname === '/api/restart') {
-      terminateClaudeProcess('Starting a new chat');
-      resetConversation();
+      const ctx = getRequestInstance(req, url);
+      terminateClaudeProcess(ctx, 'Starting a new chat');
+      resetConversation(ctx);
       jsonResponse(res, 200, { ok: true });
       return true;
     }
 
     if (req.method === 'POST' && url.pathname === '/api/start') {
-      startClaude();
+      const ctx = getRequestInstance(req, url);
+      startClaude(ctx);
       jsonResponse(res, 200, { ok: true });
       return true;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/logs') {
-      jsonResponse(res, 200, { ok: true, stderr: stderrRing, state });
+      const ctx = getRequestInstance(req, url);
+      jsonResponse(res, 200, { ok: true, stderr: ctx.stderrRing, state: ctx.state });
       return true;
     }
   } catch (error) {
@@ -1938,6 +2009,9 @@ function mimeType(filePath) {
   })[ext] || 'application/octet-stream';
 }
 
+const cleanupTimer = setInterval(cleanupIdleInstances, Math.min(INSTANCE_TTL_MS, 10 * 60 * 1000));
+cleanupTimer.unref?.();
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || `${HOST}:${PORT}`}`);
   if (await handleAuthRoutes(req, res, url)) return;
@@ -1954,14 +2028,14 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`Claude Web Chat listening on http://${HOST}:${PORT}`);
   console.log(`Working directory for Claude CLI: ${CLAUDE_CWD}`);
-  console.log(`Claude command: ${state.command}`);
+  console.log(`Claude command: ${resolveClaudeCommand()}`);
 });
 
 process.on('SIGINT', () => {
-  stopClaude();
+  stopAllClaudeInstances();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
-  stopClaude();
+  stopAllClaudeInstances();
   process.exit(0);
 });

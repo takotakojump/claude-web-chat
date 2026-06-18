@@ -100,7 +100,8 @@ Edit `config.json`. Values are injected only into the Claude CLI child process; 
 {
   "server": {
     "host": "127.0.0.1",
-    "port": 3652
+    "port": 3652,
+    "instanceTtlMinutes": 120
   },
   "auth": {
     "enabled": false,
@@ -139,6 +140,7 @@ Important fields:
 - `claude.sessionDir` -> optional explicit session directory override.
 - `server.host` -> bind address; use `0.0.0.0` for LAN/mobile access.
 - `server.port` -> defaults to `3652`.
+- `server.instanceTtlMinutes` -> idle per-browser chat instances are cleaned up after this many minutes.
 
 `config.json` is ignored by git because it can contain secrets. Use `config.example.json` as a template.
 
@@ -171,8 +173,14 @@ By default the session directory is derived from `claude.cwd`. Advanced override
 Set `claude.sessionDir` only if your Claude CLI stores sessions somewhere custom.
 The app refuses to delete outside the resolved session directory.
 
+## Multi-client isolation
+
+Each browser tab/window gets its own Claude CLI process, event stream, pending tool prompts, and in-memory chat view. Starting a new chat or loading history in one client will not reset another client's screen. Idle instances with no connected browser are cleaned up after `server.instanceTtlMinutes`.
+
+Claude's on-disk session files are still shared by the same `claude.cwd`, so deleting or clearing history removes those files globally.
+
 ## Interactions
 
 Claude CLI permission prompts, MCP elicitation requests, and Claude Code's `AskUserQuestion` choice prompts are shown as cards above the input box. `AskUserQuestion` supports single choice, multi-select, optional custom "Other" answers, option previews, and notes.
 
-On mobile, use the menu button to open the sidebar; the chat and interaction cards adapt to narrow screens.
+On mobile, use the menu button to open the sidebar; the chat and interaction cards adapt to narrow screens. The mobile sidebar itself scrolls, so long history lists do not squeeze the history card.

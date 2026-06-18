@@ -1099,6 +1099,16 @@ button:disabled {
     padding: 12px;
   }
 
+  .history-card,
+  .session-list {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .side-footer {
+    margin-top: 16px;
+  }
+
   .choice-button {
     width: 100%;
   }
