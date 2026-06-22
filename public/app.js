@@ -222,15 +222,57 @@ async function sendPrompt() {
 
 function getClientInstanceId() {
   const key = 'claude-web-chat.instance-id';
-  let id = sessionStorage.getItem(key);
+  const urlId = normalizeClientInstanceId(new URLSearchParams(location.search).get('instance'));
+  if (urlId) {
+    writeSessionValue(key, urlId);
+    return syncInstanceIdToUrl(urlId);
+  }
+
+  let id = normalizeClientInstanceId(readSessionValue(key));
   if (!id) {
     const random = globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
       ? globalThis.crypto.randomUUID()
       : `${Date.now()}-${Math.random()}`;
-    id = `web-${random.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64)}`;
-    sessionStorage.setItem(key, id);
+    id = normalizeClientInstanceId(`web-${random.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64)}`);
+    writeSessionValue(key, id);
   }
-  return id;
+  return syncInstanceIdToUrl(id);
+}
+
+function normalizeClientInstanceId(value) {
+  const id = String(value || '').trim();
+  return /^[a-zA-Z0-9_-]{8,80}$/.test(id) ? id : '';
+}
+
+function readSessionValue(key) {
+  try {
+    return sessionStorage.getItem(key) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writeSessionValue(key, value) {
+  try {
+    sessionStorage.setItem(key, value);
+  } catch {
+    // Private browsing or locked-down browsers can reject sessionStorage.
+  }
+}
+
+function syncInstanceIdToUrl(id) {
+  const normalized = normalizeClientInstanceId(id);
+  if (!normalized) return '';
+  try {
+    const url = new URL(location.href);
+    if (url.searchParams.get('instance') !== normalized) {
+      url.searchParams.set('instance', normalized);
+      history.replaceState(history.state, '', `${url.pathname}${url.search}${url.hash}`);
+    }
+  } catch {
+    // Keeping the in-memory instance id is still enough for the current tab.
+  }
+  return normalized;
 }
 
 function instanceHeaders(extra = {}) {

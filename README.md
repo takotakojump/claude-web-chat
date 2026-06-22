@@ -177,6 +177,8 @@ The app refuses to delete outside the resolved session directory.
 
 Each browser tab/window gets its own Claude CLI process, event stream, pending tool prompts, and in-memory chat view. Starting a new chat or loading history in one client will not reset another client's screen. Idle instances with no connected browser are cleaned up after `server.instanceTtlMinutes`.
 
+The page adds an `instance` query parameter after it opens. Refreshing or reopening that exact URL reconnects to the same in-memory instance, so unresolved permission/choice prompts are shown again. Resolved prompts are not replayed; open the base URL without the `instance` parameter when you want a separate client.
+
 Claude's on-disk session files are still shared by the same `claude.cwd`, so deleting or clearing history removes those files globally.
 
 ## Interactions
