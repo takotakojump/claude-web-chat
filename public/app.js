@@ -582,7 +582,18 @@ function renderElicitationBody(card, data) {
   if (data.url) {
     const link = document.createElement('p');
     link.className = 'form-help';
-    link.innerHTML = `链接：<a href="${escapeAttribute(data.url)}" target="_blank" rel="noreferrer">${escapeHtml(data.url)}</a>`;
+    const safeUrl = safeExternalUrl(data.url);
+    if (safeUrl) {
+      link.append('Link: ');
+      const anchor = document.createElement('a');
+      anchor.href = safeUrl;
+      anchor.target = '_blank';
+      anchor.rel = 'noreferrer noopener';
+      anchor.textContent = data.url;
+      link.appendChild(anchor);
+    } else {
+      link.textContent = `Blocked unsafe link: ${data.url}`;
+    }
     card.appendChild(link);
   }
 
@@ -1108,6 +1119,15 @@ function localizeStatus(status) {
 
 function shortId(id) {
   return String(id).slice(0, 8);
+}
+
+function safeExternalUrl(value) {
+  try {
+    const url = new URL(String(value || ''), window.location.href);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+  } catch {
+    return '';
+  }
 }
 
 function escapeHtml(value) {

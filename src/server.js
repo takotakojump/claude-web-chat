@@ -706,7 +706,7 @@ function terminateClaudeProcess(ctx, reason) {
       id: interaction.id,
       status: 'cancelled',
       label: reason || 'Claude CLI stopped',
-    });
+    }, { log: false });
   }
   ctx.pendingInteractions.clear();
   if (process.platform === 'win32' && child.pid) {
@@ -874,7 +874,7 @@ function startClaude(ctx) {
         id: interaction.id,
         status: 'cancelled',
         label: 'Claude CLI stopped',
-      });
+      }, { log: false });
     }
     ctx.pendingInteractions.clear();
     ctx.claudeProcess = null;
@@ -1189,15 +1189,15 @@ function handleControlRequest(ctx, message) {
   ctx.pendingInteractions.set(requestId, interaction);
 
   if (kind === 'permission') {
-    emit(ctx, 'interaction_new', buildPermissionInteraction(requestId, request));
+    emit(ctx, 'interaction_new', buildPermissionInteraction(requestId, request), { log: false });
     return;
   }
   if (kind === 'ask_user_question') {
-    emit(ctx, 'interaction_new', buildAskUserQuestionInteraction(requestId, request));
+    emit(ctx, 'interaction_new', buildAskUserQuestionInteraction(requestId, request), { log: false });
     return;
   }
   if (kind === 'elicitation') {
-    emit(ctx, 'interaction_new', buildElicitationInteraction(requestId, request));
+    emit(ctx, 'interaction_new', buildElicitationInteraction(requestId, request), { log: false });
     return;
   }
   emit(ctx, 'interaction_new', {
@@ -1206,14 +1206,14 @@ function handleControlRequest(ctx, message) {
     title: `Claude requests ${request.subtype || 'input'}`,
     description: 'Provide a JSON response for this SDK control request.',
     request: compactValue(request),
-  });
+  }, { log: false });
 }
 
 function handleControlCancel(ctx, message) {
   const id = message.request_id;
   if (!id) return;
   ctx.pendingInteractions.delete(id);
-  emit(ctx, 'interaction_resolved', { id, status: 'cancelled', label: 'Cancelled' });
+  emit(ctx, 'interaction_resolved', { id, status: 'cancelled', label: 'Cancelled' }, { log: false });
 }
 
 function buildPermissionInteraction(id, request) {
@@ -1447,7 +1447,7 @@ function respondToInteraction(ctx, body) {
     id,
     status: 'resolved',
     label: labelForAction(action),
-  });
+  }, { log: false });
 }
 
 function buildPermissionResponse(id, action, request, body) {
@@ -1639,31 +1639,64 @@ async function readJsonBody(req) {
   return JSON.parse(body);
 }
 
+function securityHeaders(extra = {}) {
+  return {
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'x-frame-options': 'DENY',
+    ...extra,
+  };
+}
+
+function appContentSecurityPolicy() {
+  return [
+    "default-src 'self'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "connect-src 'self'",
+    "img-src 'self' data:",
+  ].join('; ');
+}
+
+function staticHeaders(filePath) {
+  const headers = {
+    'content-type': mimeType(filePath),
+    'cache-control': 'no-cache',
+  };
+  if (path.extname(filePath).toLowerCase() === '.html') {
+    headers['content-security-policy'] = appContentSecurityPolicy();
+  }
+  return securityHeaders(headers);
+}
+
 function jsonResponse(res, statusCode, payload, headers = {}) {
-  res.writeHead(statusCode, {
+  res.writeHead(statusCode, securityHeaders({
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     ...headers,
-  });
+  }));
   res.end(JSON.stringify(payload));
 }
 
 
 function htmlResponse(res, statusCode, body, headers = {}) {
-  res.writeHead(statusCode, {
+  res.writeHead(statusCode, securityHeaders({
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
     ...headers,
-  });
+  }));
   res.end(body);
 }
 
 function redirectResponse(res, location, headers = {}) {
-  res.writeHead(302, {
+  res.writeHead(302, securityHeaders({
     location,
     'cache-control': 'no-store',
     ...headers,
-  });
+  }));
   res.end();
 }
 
@@ -1891,7 +1924,7 @@ async function handleApi(req, res, url) {
       sendSse(res, 'snapshot', {
         state: ctx.state,
         instanceId: ctx.id,
-        events: ctx.eventLog,
+        events: ctx.eventLog.filter(event => !String(event.type || '').startsWith('interaction_')),
         pendingInteractions: Array.from(ctx.pendingInteractions.values()).map(interaction => {
           if (interaction.kind === 'permission') {
             return buildPermissionInteraction(interaction.id, interaction.request);
@@ -1974,25 +2007,22 @@ function serveStatic(res, pathname) {
   try {
     filePath = path.join(PUBLIC_DIR, decodeURIComponent(cleanPath));
   } catch {
-    res.writeHead(400);
+    res.writeHead(400, securityHeaders());
     res.end('Bad request');
     return;
   }
   if (!filePath.startsWith(PUBLIC_DIR)) {
-    res.writeHead(403);
+    res.writeHead(403, securityHeaders());
     res.end('Forbidden');
     return;
   }
   fs.readFile(filePath, (error, data) => {
     if (error) {
-      res.writeHead(404);
+      res.writeHead(404, securityHeaders());
       res.end('Not found');
       return;
     }
-    res.writeHead(200, {
-      'content-type': mimeType(filePath),
-      'cache-control': 'no-cache',
-    });
+    res.writeHead(200, staticHeaders(filePath));
     res.end(data);
   });
 }
